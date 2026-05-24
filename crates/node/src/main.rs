@@ -226,11 +226,9 @@ fn main() {
             // behavior so headless / systemd / CI runs don't change.
             if tui {
                 let log_path = config.node.datadir.join("pyde.log");
-                if let Err(e) = logging::init_file(
-                    &config.logging.level,
-                    config.logging.json,
-                    &log_path,
-                ) {
+                if let Err(e) =
+                    logging::init_file(&config.logging.level, config.logging.json, &log_path)
+                {
                     eprintln!("error: --tui log file init failed: {}", e);
                     std::process::exit(1);
                 }

@@ -410,7 +410,8 @@ mod tests {
         nonces.insert(peer, nonce_we_sent);
 
         let (resp_other_nonce, _, _) = build_real_attestation([0x22; 32]);
-        let outcome = apply_auth_response(peer, &resp_other_nonce, &mut nonces, &mut mgr, &[], None);
+        let outcome =
+            apply_auth_response(peer, &resp_other_nonce, &mut nonces, &mut mgr, &[], None);
         assert_eq!(outcome, AuthOutcome::VerifyFailed);
         assert!(mgr.peer_falcon_pubkey(&peer).is_none());
         // Nonce still consumed so the peer can't keep retrying the same slot.
@@ -485,8 +486,7 @@ mod tests {
         let (resp, pk_bytes, _sk) = build_real_attestation(nonce);
 
         // Pin is exactly the pubkey the peer is about to attest.
-        let outcome =
-            apply_auth_response(peer, &resp, &mut nonces, &mut mgr, &[], Some(&pk_bytes));
+        let outcome = apply_auth_response(peer, &resp, &mut nonces, &mut mgr, &[], Some(&pk_bytes));
         assert_eq!(outcome, AuthOutcome::StoredAsNonValidator);
         assert_eq!(mgr.peer_falcon_pubkey(&peer), Some(pk_bytes.as_slice()));
     }

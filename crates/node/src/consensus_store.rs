@@ -479,9 +479,7 @@ impl ConsensusStateStore {
                 .map_err(|e| format!("failed to prune evidence: {}", e))?;
             debug!(
                 pruned = count,
-                proposal_floor,
-                vote_vc_floor,
-                "evidence pruned"
+                proposal_floor, vote_vc_floor, "evidence pruned"
             );
         }
         Ok(count)

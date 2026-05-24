@@ -376,8 +376,9 @@ impl Discovery {
             .iter()
             .filter(|(_, e)| !e.is_expired())
             .map(|(peer_id, entry)| {
-                let remaining_secs =
-                    entry.duration_secs.saturating_sub(entry.banned_at.elapsed().as_secs());
+                let remaining_secs = entry
+                    .duration_secs
+                    .saturating_sub(entry.banned_at.elapsed().as_secs());
                 let expires_at_unix_ms = now_ms.saturating_add(remaining_secs.saturating_mul(1000));
                 BanFileEntry {
                     peer_id: peer_id.to_string(),
@@ -651,7 +652,10 @@ mod tests {
         let peer = random_peer();
         disco.add_falcon_pubkey_pin(peer, vec![0xAA; 897]);
         disco.add_falcon_pubkey_pin(peer, vec![0xBB; 897]);
-        assert_eq!(disco.pinned_falcon_pubkey(&peer), Some(vec![0xBB; 897].as_slice()));
+        assert_eq!(
+            disco.pinned_falcon_pubkey(&peer),
+            Some(vec![0xBB; 897].as_slice())
+        );
         assert_eq!(disco.pinned_pubkey_count(), 1);
     }
 

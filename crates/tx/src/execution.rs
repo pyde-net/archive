@@ -95,12 +95,14 @@ pub fn pre_execution_charge(
     gas_tank_balance: &mut u128,
     base_fee: u128,
 ) -> Result<u128, String> {
-    let max_gas_cost = (tx.gas_limit as u128).checked_mul(base_fee).ok_or_else(|| {
-        format!(
-            "fee overflow: gas_limit ({}) * base_fee ({}) > u128::MAX",
-            tx.gas_limit, base_fee
-        )
-    })?;
+    let max_gas_cost = (tx.gas_limit as u128)
+        .checked_mul(base_fee)
+        .ok_or_else(|| {
+            format!(
+                "fee overflow: gas_limit ({}) * base_fee ({}) > u128::MAX",
+                tx.gas_limit, base_fee
+            )
+        })?;
 
     match &tx.fee_payer {
         FeePayer::Sender => {

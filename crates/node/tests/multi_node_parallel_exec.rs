@@ -50,8 +50,7 @@ fn parallel_exec_fires_on_non_proposers() {
     // mainnet. We use devnet here for the same reasons every other
     // multi-node test does: localhost binds, faster setup, no
     // additional bootstrap-pubkey-pin gymnastics.
-    let net = TestNetwork::spawn(4, true)
-        .unwrap_or_else(|e| panic!("spawn 4v devnet: {}", e));
+    let net = TestNetwork::spawn(4, true).unwrap_or_else(|e| panic!("spawn 4v devnet: {}", e));
 
     // 60s warm-up — 4-validator boot + FALCON keygen + libp2p mesh
     // formation + first-slot block production occasionally exceeds
@@ -244,9 +243,8 @@ fn parallel_exec_fires_on_non_proposers() {
 
         let post_roots: Vec<String> = (0..4)
             .map(|i| {
-                net.state_root(i).unwrap_or_else(|e| {
-                    panic!("burst {} post state_root node-{}: {}", burst, i, e)
-                })
+                net.state_root(i)
+                    .unwrap_or_else(|e| panic!("burst {} post state_root node-{}: {}", burst, i, e))
             })
             .collect();
         assert!(

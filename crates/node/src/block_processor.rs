@@ -224,8 +224,7 @@ impl BlockProcessor {
         let gas_target_for_catchup = pyde_tx::fee::GAS_TARGET;
         let slots_to_skip = slot.saturating_sub(chain.head_slot.saturating_add(1));
         for _ in 0..slots_to_skip {
-            chain.base_fee =
-                adjust_base_fee(chain.base_fee, 0, gas_target_for_catchup);
+            chain.base_fee = adjust_base_fee(chain.base_fee, 0, gas_target_for_catchup);
         }
         let block_ctx = BlockContext {
             height: slot,
@@ -1855,8 +1854,7 @@ mod tests {
         .expect("audit-415: block whose slot equals the WS checkpoint must apply");
 
         assert_eq!(
-            chain.head_slot,
-            7,
+            chain.head_slot, 7,
             "head must advance even though ws_checkpoint == block.slot (was {})",
             pre_head
         );

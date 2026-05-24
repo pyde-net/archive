@@ -145,7 +145,13 @@ fn encrypted_tx_decrypts_after_pss_refresh() {
         .epoch_of(0, EPOCH_LENGTH)
         .unwrap_or_else(|e| panic!("epoch_of {}: {}", EPOCH_LENGTH, e))
         .unwrap_or_else(|| panic!("missing block at slot {}", EPOCH_LENGTH));
-    assert_eq!(e0, 0, "slot {} should be epoch 0, got {}", EPOCH_LENGTH - 1, e0);
+    assert_eq!(
+        e0,
+        0,
+        "slot {} should be epoch 0, got {}",
+        EPOCH_LENGTH - 1,
+        e0
+    );
     assert_eq!(e1, 1, "slot {} should be epoch 1, got {}", EPOCH_LENGTH, e1);
 
     // Rotation log on every validator — proof the rotate_to_epoch +
@@ -165,7 +171,11 @@ fn encrypted_tx_decrypts_after_pss_refresh() {
         rotated,
         net.nodes.len()
     );
-    eprintln!("rotation log observed on {}/{} nodes", rotated, net.nodes.len());
+    eprintln!(
+        "rotation log observed on {}/{} nodes",
+        rotated,
+        net.nodes.len()
+    );
 
     // ── Post-rotation pubkey snapshot ──────────────────────────────
     let tpk_post: Vec<Vec<u8>> = (0..net.nodes.len())
@@ -187,7 +197,8 @@ fn encrypted_tx_decrypts_after_pss_refresh() {
     // raced with the refresh (validator coherence bug) or the
     // protocol implementation regressed.
     assert_eq!(
-        tpk_post[0], tpk_pre[0],
+        tpk_post[0],
+        tpk_pre[0],
         "threshold pubkey changed across epoch boundary — \
          PSS refresh should preserve Y = g^s (pre len={}, post len={})",
         tpk_pre[0].len(),

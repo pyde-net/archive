@@ -605,11 +605,7 @@ impl SafetyChecker {
             // `cross_call` + `raw_call`, so e.g. `deploy!` propagated
             // as pure and a wrapper `fn x() { deploy!(...) }` was
             // (silently) callable from a `#[view]` function.
-            Expr::MacroCall(name, _, _)
-                if !VIEW_PURE_MACROS.contains(&name.name.as_str()) =>
-            {
-                true
-            }
+            Expr::MacroCall(name, _, _) if !VIEW_PURE_MACROS.contains(&name.name.as_str()) => true,
             _ if self.is_storage_mutating_call(expr) => true,
             Expr::If(_, then_block, else_clause, _) => {
                 let mut impure = self.scan_direct_impurity(then_block, call_targets);
@@ -790,9 +786,7 @@ impl SafetyChecker {
                 self.check_view_macros_in_expr(lhs, func_name);
                 self.check_view_macros_in_expr(rhs, func_name);
             }
-            Expr::Unary(_, operand, _) => {
-                self.check_view_macros_in_expr(operand, func_name)
-            }
+            Expr::Unary(_, operand, _) => self.check_view_macros_in_expr(operand, func_name),
             Expr::FieldAccess(obj, _, _) => self.check_view_macros_in_expr(obj, func_name),
             Expr::Index(obj, idx, _) => {
                 self.check_view_macros_in_expr(obj, func_name);
@@ -1872,10 +1866,10 @@ mod tests {
             }
         "#,
         );
-        assert!(errors
-            .iter()
-            .any(|e| e.message.contains("iteration over `Map` is not supported")
-                && e.message.contains("self.balances")));
+        assert!(errors.iter().any(
+            |e| e.message.contains("iteration over `Map` is not supported")
+                && e.message.contains("self.balances")
+        ));
     }
 
     #[test]

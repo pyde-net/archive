@@ -270,13 +270,7 @@ fn mixed_workload_load_test() {
     let external_rpc_env = std::env::var("PYDE_LOADGEN_EXTERNAL_RPC_URLS").ok();
     let external_faucet_env = std::env::var("PYDE_LOADGEN_EXTERNAL_FAUCET_KEY").ok();
 
-    let (
-        net_opt,
-        rpc_urls,
-        faucet_pk_bytes,
-        faucet_sk_bytes,
-        node_outputs,
-    ): (
+    let (net_opt, rpc_urls, faucet_pk_bytes, faucet_sk_bytes, node_outputs): (
         Option<TestNetwork>,
         Vec<String>,
         Vec<u8>,
@@ -413,11 +407,7 @@ fn mixed_workload_load_test() {
             for w in &wallets {
                 let url = &rpc_urls[poll_idx % rpc_urls.len()];
                 poll_idx += 1;
-                if fetch_balance(&client, url, &w.address)
-                    .await
-                    .unwrap_or(0)
-                    > 0
-                {
+                if fetch_balance(&client, url, &w.address).await.unwrap_or(0) > 0 {
                     funded += 1;
                 }
             }
@@ -484,11 +474,7 @@ fn mixed_workload_load_test() {
             for w in &wallets {
                 let url = &rpc_urls[reg_poll_idx % rpc_urls.len()];
                 reg_poll_idx += 1;
-                if fetch_nonce(&client, url, &w.address)
-                    .await
-                    .unwrap_or(0)
-                    >= 1
-                {
+                if fetch_nonce(&client, url, &w.address).await.unwrap_or(0) >= 1 {
                     registered += 1;
                 }
             }
@@ -513,11 +499,7 @@ fn mixed_workload_load_test() {
                             n += 1;
                         }
                     }
-                    per_node.push((
-                        url.clone(),
-                        n,
-                        head_opt.map(|h| h as i64).unwrap_or(-1),
-                    ));
+                    per_node.push((url.clone(), n, head_opt.map(|h| h as i64).unwrap_or(-1)));
                 }
                 let breakdown: Vec<String> = per_node
                     .iter()
@@ -530,7 +512,10 @@ fn mixed_workload_load_test() {
                     .map(|(k, v)| format!("[{}] x{}", k, v))
                     .collect();
                 let total_errs: u64 = reg_err_snapshot.iter().map(|(_, v)| *v).sum();
-                eprintln!("\n  RegisterPubkey submission errors ({} total):", total_errs);
+                eprintln!(
+                    "\n  RegisterPubkey submission errors ({} total):",
+                    total_errs
+                );
                 for line in &errs_str {
                     eprintln!("    {}", line);
                 }
@@ -540,13 +525,7 @@ fn mixed_workload_load_test() {
                 for (i, handle) in node_outputs.iter().enumerate() {
                     let lines = handle.lock().unwrap().clone();
                     let path = format!("/tmp/loadgen-mixed-panic-node-{}.log", i);
-                    let tail: Vec<String> = lines
-                        .iter()
-                        .rev()
-                        .take(400)
-                        .rev()
-                        .cloned()
-                        .collect();
+                    let tail: Vec<String> = lines.iter().rev().take(400).rev().cloned().collect();
                     let _ = std::fs::write(&path, tail.join("\n"));
                     eprintln!("    [node-{}] tail dumped → {}", i, path);
                 }
@@ -669,8 +648,7 @@ fn mixed_workload_load_test() {
     // wasting 3 h 50 min after a wedge at minute 10 is worse than
     // useless — it makes the post-run digest harder to read and
     // burns CI / operator time).
-    let wedge_detected =
-        Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let wedge_detected = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     runtime.block_on(async {
         let mut tasks = Vec::with_capacity(num_senders);
@@ -691,18 +669,18 @@ fn mixed_workload_load_test() {
                 let mut nonce = 1u64; // nonce 0 was RegisterPubkey
                 let mut next_submit = Instant::now();
                 let mut submit_idx: u64 = (i as u64) * 7919; // staggered seed so senders don't all pick the same kind in lockstep
-                // Sustained-load nonce-drift detection. The error
-                // path resyncs reactively, but a tx accepted by the
-                // RPC ingress (HTTP 200) can still silently fail to
-                // land — mempool eviction under burst load, reorgs,
-                // network-level body drops. If that happens, the
-                // local nonce ratchets forward while the chain's
-                // doesn't, and every subsequent submission collides
-                // with "(sender, nonce) above window". The reactive
-                // resync used to bail (`chain_nonce > nonce`); now
-                // it unconditionally trusts the chain. Periodic
-                // drift checks every DRIFT_CHECK_EVERY successes
-                // catch the silent-failure case before it cascades.
+                                                             // Sustained-load nonce-drift detection. The error
+                                                             // path resyncs reactively, but a tx accepted by the
+                                                             // RPC ingress (HTTP 200) can still silently fail to
+                                                             // land — mempool eviction under burst load, reorgs,
+                                                             // network-level body drops. If that happens, the
+                                                             // local nonce ratchets forward while the chain's
+                                                             // doesn't, and every subsequent submission collides
+                                                             // with "(sender, nonce) above window". The reactive
+                                                             // resync used to bail (`chain_nonce > nonce`); now
+                                                             // it unconditionally trusts the chain. Periodic
+                                                             // drift checks every DRIFT_CHECK_EVERY successes
+                                                             // catch the silent-failure case before it cascades.
                 const DRIFT_CHECK_EVERY: u64 = 50;
                 let mut consecutive_oks: u64 = 0;
                 loop {
@@ -728,9 +706,9 @@ fn mixed_workload_load_test() {
                     submit_idx += 1;
 
                     let result: Result<Option<[u8; 32]>, ()> = match kind {
-                        TxKind::Transfer => submit_transfer(&cli, &url, &wallet, nonce)
-                            .await
-                            .map(Some),
+                        TxKind::Transfer => {
+                            submit_transfer(&cli, &url, &wallet, nonce).await.map(Some)
+                        }
                         TxKind::Call => {
                             if cnt_addr == [0u8; 32] {
                                 Ok(None) // skipped; treat as no-op
@@ -918,16 +896,10 @@ fn mixed_workload_load_test() {
                         "\n*** WEDGE DETECTED: no head advance for {} s ***",
                         stalled_for.as_secs(),
                     );
-                    eprintln!(
-                        "    per-node last head: {:?}",
-                        current_heads,
-                    );
+                    eprintln!("    per-node last head: {:?}", current_heads,);
                     for (i, handle) in wd_outputs.iter().enumerate() {
                         let lines = handle.lock().unwrap().clone();
-                        let path = format!(
-                            "/tmp/pyde-soak-wedge-node-{}.log",
-                            i,
-                        );
+                        let path = format!("/tmp/pyde-soak-wedge-node-{}.log", i,);
                         let tail: Vec<String> = lines
                             .iter()
                             .rev()
@@ -969,8 +941,7 @@ fn mixed_workload_load_test() {
             // (cadence inching past 400 ms) is visible per-checkpoint
             // even if the watchdog's stall threshold isn't crossed.
             let mut last_heads: Vec<Option<u64>> = vec![None; cp_urls.len()];
-            let mut last_advance_at: Vec<Instant> =
-                vec![Instant::now(); cp_urls.len()];
+            let mut last_advance_at: Vec<Instant> = vec![Instant::now(); cp_urls.len()];
             loop {
                 tokio::time::sleep(CHECKPOINT_INTERVAL).await;
                 if Instant::now() >= cp_deadline {
@@ -997,15 +968,11 @@ fn mixed_workload_load_test() {
                         last_advance_at[i] = now;
                     }
                     last_heads[i] = head;
-                    let head_str = head
-                        .map(|h| h.to_string())
-                        .unwrap_or_else(|| "??".into());
+                    let head_str = head.map(|h| h.to_string()).unwrap_or_else(|| "??".into());
                     let epoch_str = head
                         .map(|h| (h / pyde_consensus::block::EPOCH_LENGTH).to_string())
                         .unwrap_or_else(|| "??".into());
-                    let ms_since = now
-                        .duration_since(last_advance_at[i])
-                        .as_millis();
+                    let ms_since = now.duration_since(last_advance_at[i]).as_millis();
                     let mempool_str = mempool
                         .map(|m| m.to_string())
                         .unwrap_or_else(|| "??".into());
@@ -1522,12 +1489,12 @@ async fn run_verifications(
         "  (1) include-rate (full receipt audit, head_slot={})",
         head_slot
     );
-    let (t_ok, t_fail, t_miss, t_sampled) = full_receipt_audit(client, &pool, &transfer_hashes).await;
+    let (t_ok, t_fail, t_miss, t_sampled) =
+        full_receipt_audit(client, &pool, &transfer_hashes).await;
     let (c_ok, c_fail, c_miss, c_sampled) = full_receipt_audit(client, &pool, &call_hashes).await;
     let t_landed = t_ok + t_fail;
     let c_landed = c_ok + c_fail;
-    let submitted_measure =
-        submit_snap.transfer_ok_measure + submit_snap.call_ok_measure;
+    let submitted_measure = submit_snap.transfer_ok_measure + submit_snap.call_ok_measure;
     // Audit caps sampling at `RECEIPT_AUDIT_CAP` per kind for large
     // soaks (else hours of RPC pacing). Report rate as landed/sampled
     // — extrapolation against `hashes.len()` would underreport the
@@ -1588,9 +1555,13 @@ async fn run_verifications(
             break;
         }
         sample_count += 1;
-        let bal = fetch_balance(client, pool.next(), &w.address).await.unwrap_or(0);
+        let bal = fetch_balance(client, pool.next(), &w.address)
+            .await
+            .unwrap_or(0);
         tokio::time::sleep(Duration::from_millis(RPC_PACING_MS)).await;
-        let nonce = fetch_nonce(client, pool.next(), &w.address).await.unwrap_or(0);
+        let nonce = fetch_nonce(client, pool.next(), &w.address)
+            .await
+            .unwrap_or(0);
         tokio::time::sleep(Duration::from_millis(RPC_PACING_MS)).await;
         // After register (nonce 0) + any successful sends, nonce on chain ≥ 2.
         // Any included tx debits ≥ 1 quanta + base_fee*gas → balance drops.
@@ -1628,8 +1599,14 @@ async fn run_verifications(
             .map(|v| v.to_string())
             .unwrap_or_else(|| "<call failed>".to_string())
     );
-    println!("      execution-success calls (chain-side, measurement window):  {}", c_ok);
-    println!("      submitted calls (RPC-accepted, total): {}", submit_snap.call_ok);
+    println!(
+        "      execution-success calls (chain-side, measurement window):  {}",
+        c_ok
+    );
+    println!(
+        "      submitted calls (RPC-accepted, total): {}",
+        submit_snap.call_ok
+    );
 
     // ── (5) Aggregate recipient balance ─────────────────────────
     // Each wallet has a dedicated recipient (so parallel scheduling
@@ -1651,8 +1628,8 @@ async fn run_verifications(
     aggregate_recipient_balance =
         aggregate_recipient_balance.saturating_add(legacy_recipient_balance);
 
-    let expected_max = (submit_snap.transfer_ok as u128 + submit_snap.encrypted_ok as u128)
-        * TX_VALUE;
+    let expected_max =
+        (submit_snap.transfer_ok as u128 + submit_snap.encrypted_ok as u128) * TX_VALUE;
     println!("  (5) per-sender recipient balances (aggregate)");
     println!(
         "      observed: {} (= {} txs of value {}); legacy 0x42…42 balance: {}",
@@ -2093,14 +2070,18 @@ async fn wait_for_external_chain_warmup(
                                 let hex = after[..end].trim_start_matches("0x");
                                 if let Ok(n) = u64::from_str_radix(hex, 16) {
                                     if n > 2 {
-                                        println!("  ✓ external chain reachable at {} (head={})", url, n);
+                                        println!(
+                                            "  ✓ external chain reachable at {} (head={})",
+                                            url, n
+                                        );
                                         return Ok(());
                                     }
                                     last_err = format!("head={} at {}, waiting", n, url);
                                 }
                             }
                         } else {
-                            last_err = format!("unexpected blockNumber response from {}: {}", url, body);
+                            last_err =
+                                format!("unexpected blockNumber response from {}: {}", url, body);
                         }
                     }
                     Err(e) => last_err = format!("{} body decode: {}", url, e),

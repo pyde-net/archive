@@ -149,9 +149,9 @@ pub fn commit_canonical(
         // Divergence — local committed a different block at this slot
         // (proposer's own pre-QC apply, view-1 fallback, or a stale
         // reorg target). The QC is authority; we must reorg.
-        let buffered = competing_blocks.as_ref().and_then(|cb| {
-            cb.get(&(qc_slot, qc_block_hash)).cloned()
-        });
+        let buffered = competing_blocks
+            .as_ref()
+            .and_then(|cb| cb.get(&(qc_slot, qc_block_hash)).cloned());
         let reorg_target = buffered.unwrap_or_else(|| block.clone());
         match BlockProcessor::reorg_to_block(
             chain,
@@ -222,10 +222,7 @@ pub fn commit_canonical(
             head_slot,
             "canonical commit: gap — sync required"
         );
-        CommitOutcome::Gap {
-            head_slot,
-            qc_slot,
-        }
+        CommitOutcome::Gap { head_slot, qc_slot }
     } else {
         // qc_slot < head_slot but no header at qc_slot. Header pruning
         // (2-epoch retention) drops old headers, so this happens for
@@ -548,11 +545,7 @@ mod tests {
             parent_hash = h.hash();
             let block = empty_block(h);
             BlockProcessor::process_full_block_with_aot_and_checkpoint(
-                &mut chain,
-                &mut state,
-                &block,
-                None,
-                None,
+                &mut chain, &mut state, &block, None, None,
             )
             .unwrap();
         }

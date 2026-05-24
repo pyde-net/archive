@@ -909,11 +909,7 @@ impl ValidatorEngine {
     /// falling back to `identity.committee_index` only when the
     /// validator is absent from the resolved committee (degenerate —
     /// should only happen for a recently-exiting validator).
-    pub fn committee_index_for_slot(
-        &self,
-        slot: u64,
-        identity: &ValidatorIdentity,
-    ) -> u8 {
+    pub fn committee_index_for_slot(&self, slot: u64, identity: &ValidatorIdentity) -> u8 {
         let keys = self.committee_keys_for_slot(slot);
         let id_pk = identity.public_key.as_bytes();
         keys.iter()
@@ -1674,11 +1670,7 @@ impl ValidatorEngine {
         };
 
         if !try_with(&self.committee_keys) && !try_with(&self.prev_committee_keys) {
-            warn!(
-                epoch,
-                validator = idx,
-                "invalid randomness share"
-            );
+            warn!(epoch, validator = idx, "invalid randomness share");
             return false;
         }
 
@@ -1778,10 +1770,7 @@ impl ValidatorEngine {
         // target_height under our address. Different-view proposals
         // (view ≥1 fallback) go through `try_build_fallback_proposal`,
         // not this path, so they aren't affected.
-        if self
-            .seen_proposals
-            .contains_key(&(slot, identity.address))
-        {
+        if self.seen_proposals.contains_key(&(slot, identity.address)) {
             return None;
         }
 
@@ -2247,10 +2236,7 @@ impl ValidatorEngine {
         // memory linear in `cap × #slots-in-flight`, not throughput.
         const DEFERRED_FALLBACK_CAP_PER_SLOT: usize = 8;
         if self.timeout.slot != slot || self.timeout.view_change_qc.is_none() {
-            let queue = self
-                .deferred_fallback_proposals
-                .entry(slot)
-                .or_default();
+            let queue = self.deferred_fallback_proposals.entry(slot).or_default();
             if queue.len() < DEFERRED_FALLBACK_CAP_PER_SLOT {
                 queue.push((header.clone(), proposer_signature.to_vec()));
                 debug!(
@@ -2431,11 +2417,8 @@ impl ValidatorEngine {
         // mid-flight).
         let fb_committee_keys = self.committee_keys_for_slot(slot);
         let fb_committee_index = self.committee_index_for_slot(slot, identity);
-        let leader_idx = pyde_consensus::view_change::fallback_leader_index(
-            slot,
-            view,
-            fb_committee_keys.len(),
-        );
+        let leader_idx =
+            pyde_consensus::view_change::fallback_leader_index(slot, view, fb_committee_keys.len());
         if (fb_committee_index as usize) != leader_idx {
             debug!(
                 slot,
@@ -2473,9 +2456,7 @@ impl ValidatorEngine {
             if built_view >= view {
                 info!(
                     slot,
-                    view,
-                    built_view,
-                    "fallback skip: already built fallback at this view"
+                    view, built_view, "fallback skip: already built fallback at this view"
                 );
                 return None;
             }
@@ -2523,8 +2504,7 @@ impl ValidatorEngine {
 
         info!(
             slot,
-            view,
-            "built fallback proposal as deterministic view-change fallback proposer"
+            view, "built fallback proposal as deterministic view-change fallback proposer"
         );
         // Record the (slot, view) build so the second trigger from
         // the dual gossip+RR view-change-QC path bails out instead
@@ -2819,12 +2799,9 @@ impl ValidatorEngine {
                     // Track the latest vote so future same-view re-votes
                     // from this voter are still detected.
                     if let Some(store) = &self.consensus_store {
-                        if let Err(e) = store.save_seen_vote(
-                            slot,
-                            voter_index as u8,
-                            &block_hash,
-                            &vote_sig,
-                        ) {
+                        if let Err(e) =
+                            store.save_seen_vote(slot, voter_index as u8, &block_hash, &vote_sig)
+                        {
                             self.signal_persist_failure("seen-vote", &e.to_string());
                         }
                     }
@@ -2854,8 +2831,7 @@ impl ValidatorEngine {
         // straddling a rotation would form a QC whose bitmap indexes
         // into the wrong committee and every peer's `verify_qc`
         // (slot-aware via audit-402) rejects it.
-        let slot_committee_keys: Vec<Vec<u8>> =
-            self.committee_keys_for_slot(slot).to_vec();
+        let slot_committee_keys: Vec<Vec<u8>> = self.committee_keys_for_slot(slot).to_vec();
 
         // Collect vote
         let entry = self.votes.entry(slot).or_insert_with(|| SlotVotes {
@@ -2986,7 +2962,10 @@ impl ValidatorEngine {
         let vc_voter_index = self.committee_index_for_slot(slot, identity);
         if let Some((persisted_hash, persisted_sig)) = self.seen_view_changes_self.get(&slot) {
             if *persisted_hash == highest_qc_hash {
-                debug!(slot, "TPL-501: re-broadcasting persisted view-change signature");
+                debug!(
+                    slot,
+                    "TPL-501: re-broadcasting persisted view-change signature"
+                );
                 return Some(ViewChangeMessage {
                     slot,
                     highest_qc: self.consensus.highest_qc.clone(),
@@ -3179,9 +3158,7 @@ impl ValidatorEngine {
         entry.push(msg);
 
         // Try to form view change QC.
-        if let Some(vc_qc) =
-            try_form_view_change_qc(self.chain_id, slot, entry, &vc_form_keys)
-        {
+        if let Some(vc_qc) = try_form_view_change_qc(self.chain_id, slot, entry, &vc_form_keys) {
             let first_formation = self.timeout.view_change_qc.is_none();
             if first_formation {
                 self.consensus.bump_view();
@@ -3224,9 +3201,7 @@ impl ValidatorEngine {
                 // faster than this node's own VC messages reached
                 // quorum locally — observed wedge at slot 3459 in
                 // soak v17 with this race window ~150 ms wide.
-                if let Some(deferred) =
-                    self.deferred_fallback_proposals.remove(&slot)
-                {
+                if let Some(deferred) = self.deferred_fallback_proposals.remove(&slot) {
                     let count = deferred.len();
                     let mut accepted = 0usize;
                     for (header, sig) in deferred {
@@ -3528,11 +3503,8 @@ impl ValidatorEngine {
                 return false;
             }
         };
-        if !pyde_consensus::slashing::verify_double_view_change(
-            self.chain_id,
-            &evidence,
-            &pk_bytes,
-        ) {
+        if !pyde_consensus::slashing::verify_double_view_change(self.chain_id, &evidence, &pk_bytes)
+        {
             debug!(
                 slot = evidence.slot,
                 signer = hex::encode(evidence.signer),
@@ -3699,16 +3671,14 @@ impl ValidatorEngine {
             self.votes.retain(|s, _| *s >= prune_floor);
             self.view_changes.retain(|s, _| *s >= prune_floor);
             self.finality_votes.retain(|s, _| *s >= prune_floor);
-            self.buffered_proposals
-                .retain(|s, _| *s >= prune_floor);
+            self.buffered_proposals.retain(|s, _| *s >= prune_floor);
             // audit-412: deferred fallback proposals follow the
             // same prune floor as `buffered_proposals` — a slot we
             // would no longer accept a fresh proposal for is also
             // a slot we won't drain deferred entries onto.
             self.deferred_fallback_proposals
                 .retain(|s, _| *s >= prune_floor);
-            self.voted_view_per_slot
-                .retain(|s, _| *s >= prune_floor);
+            self.voted_view_per_slot.retain(|s, _| *s >= prune_floor);
             self.last_built_fallback_view_per_slot
                 .retain(|s, _| *s >= prune_floor);
             self.seen_proposals.retain(|(s, _), _| *s >= prune_floor);
@@ -3716,11 +3686,13 @@ impl ValidatorEngine {
             // Audit 327: prune the dedup sets in lockstep with their
             // backing per-slot Vecs so the sets don't grow unbounded
             // for long-running validators.
-            self.seen_view_changes.retain(|(s, _), _| *s >= prune_before);
+            self.seen_view_changes
+                .retain(|(s, _), _| *s >= prune_before);
             // TPL-501: prune the self-VC equivocation record
             // alongside its peers. The on-disk copy is pruned
             // by `store.prune_evidence_before` below.
-            self.seen_view_changes_self.retain(|s, _| *s >= prune_before);
+            self.seen_view_changes_self
+                .retain(|s, _| *s >= prune_before);
             self.seen_finality_votes.retain(|(s, _)| *s >= prune_before);
             // Audit 326: `seen_evidence` is keyed on
             // `(slot, signer)` and gates evidence ingestion to
@@ -5289,9 +5261,7 @@ mod tests {
         // prune_floor = min(5, 4) = 4 → slot-1..=3 pruned, slot-4+
         // kept (including the wedge-anchor entry at slot 4).
         assert!(
-            engine
-                .seen_proposals
-                .contains_key(&(4u64, [0xAA; 32])),
+            engine.seen_proposals.contains_key(&(4u64, [0xAA; 32])),
             "self-dedup entry at wedged target_height must survive prune"
         );
         assert!(engine.seen_proposals.iter().all(|((s, _), _)| *s >= 4));
@@ -5501,8 +5471,8 @@ mod tests {
         // detector requires KNOWN same-view for both votes (via the
         // proposals buffered for those hashes); construct two real
         // headers at view 0 and buffer them so the lookup resolves.
-        use pyde_consensus::hotstuff::{proposer_sign_message, ConsensusMessage};
         use pyde_consensus::block::{BlockHeader, QuorumCert};
+        use pyde_consensus::hotstuff::{proposer_sign_message, ConsensusMessage};
         use pyde_crypto::falcon::{falcon_keygen, falcon_sign};
 
         let (pk, sk) = falcon_keygen().unwrap();
@@ -5534,12 +5504,24 @@ mod tests {
         let hash_b = header_b.hash();
         assert_ne!(hash_a, hash_b);
 
-        engine.buffered_proposals.entry(slot).or_default().push(
-            BufferedProposal { header: header_a, proposer_signature: vec![], vrf_score: 0 },
-        );
-        engine.buffered_proposals.entry(slot).or_default().push(
-            BufferedProposal { header: header_b, proposer_signature: vec![], vrf_score: 0 },
-        );
+        engine
+            .buffered_proposals
+            .entry(slot)
+            .or_default()
+            .push(BufferedProposal {
+                header: header_a,
+                proposer_signature: vec![],
+                vrf_score: 0,
+            });
+        engine
+            .buffered_proposals
+            .entry(slot)
+            .or_default()
+            .push(BufferedProposal {
+                header: header_b,
+                proposer_signature: vec![],
+                vrf_score: 0,
+            });
 
         let sign_vote = |h: &[u8; 32]| -> Vec<u8> {
             falcon_sign(&sk, &proposer_sign_message(TEST_CHAIN_ID, slot, h))
@@ -6003,10 +5985,7 @@ mod tests {
             let vote = voter
                 .on_proposal(&header, &identities[i])
                 .expect("pre-rotation vote should be created");
-            assert!(
-                collector.on_vote(vote).is_none(),
-                "2 votes < 3-of-4 quorum"
-            );
+            assert!(collector.on_vote(vote).is_none(), "2 votes < 3-of-4 quorum");
         }
 
         // Phase 2: rotate to epoch 1 with a SHUFFLED committee — same
@@ -6866,9 +6845,12 @@ mod tests {
         state.refresh_root();
 
         // Honest decryptor, committed order [A, B].
-        let mut honest =
-            BlockDecryptor::new(vec![tx_a.clone(), tx_b.clone()], 2, committee_falcon_pks.clone())
-                .unwrap();
+        let mut honest = BlockDecryptor::new(
+            vec![tx_a.clone(), tx_b.clone()],
+            2,
+            committee_falcon_pks.clone(),
+        )
+        .unwrap();
         honest.add_share(
             0,
             pyde_crypto::threshold::generate_decryption_share(
@@ -7184,7 +7166,9 @@ mod tests {
 
         // The slot's `seen_evidence` dedup record is set so a
         // re-arrival of either VC doesn't double-queue.
-        assert!(engine.seen_evidence.contains(&(target_slot, attacker.address)));
+        assert!(engine
+            .seen_evidence
+            .contains(&(target_slot, attacker.address)));
     }
 
     /// TPL-502 control: a benign re-broadcast of the SAME VC
@@ -7358,18 +7342,11 @@ mod tests {
         // Whichever validator's committee_index matches the view-1
         // fallback_leader_index is the builder.
         let view = leader_engine.consensus.current_view;
-        let leader_idx = pyde_consensus::view_change::fallback_leader_index(
-            target_slot,
-            view,
-            keys.len(),
-        );
+        let leader_idx =
+            pyde_consensus::view_change::fallback_leader_index(target_slot, view, keys.len());
 
         let block = leader_engine
-            .try_build_fallback_proposal(
-                &identities[leader_idx],
-                [0u8; 32],
-                [0u8; 32],
-            )
+            .try_build_fallback_proposal(&identities[leader_idx], [0u8; 32], [0u8; 32])
             .expect("leader must produce a fallback proposal");
         let header = block.header;
         let proposer_sig = block.proposer_signature;
@@ -7388,8 +7365,7 @@ mod tests {
         // returned false and discarded the proposal. With audit-412
         // it returns false but stashes the proposal in the deferred
         // queue.
-        let accepted_before_vc_qc =
-            receiver.buffer_proposal(&header, &proposer_sig);
+        let accepted_before_vc_qc = receiver.buffer_proposal(&header, &proposer_sig);
         assert!(
             !accepted_before_vc_qc,
             "buffer_proposal returns false when VC-QC missing"

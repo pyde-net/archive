@@ -131,8 +131,8 @@ fn render_loop(
             .unwrap_or_else(|| Duration::from_millis(0));
         if event::poll(timeout)? {
             if let Event::Key(k) = event::read()? {
-                let ctrl_c = k.modifiers.contains(KeyModifiers::CONTROL)
-                    && k.code == KeyCode::Char('c');
+                let ctrl_c =
+                    k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c');
                 if matches!(k.code, KeyCode::Char('q') | KeyCode::Esc) || ctrl_c {
                     quit_flag.store(true, Ordering::Relaxed);
                     break;
@@ -183,14 +183,16 @@ fn render_header(f: &mut ratatui::Frame, area: Rect) {
     };
     let local = *snapshot().local_address.read().unwrap();
     let text = Line::from(vec![
-        Span::styled(" pyde ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " pyde ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(format!("· role={} ", role)),
         Span::raw(format!("· addr=0x{}", &hex::encode(&local[..6]))),
         Span::raw("   "),
-        Span::styled(
-            "(q to quit)",
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled("(q to quit)", Style::default().fg(Color::DarkGray)),
     ]);
     let p = Paragraph::new(text).block(Block::default().borders(Borders::ALL));
     f.render_widget(p, area);
@@ -218,14 +220,16 @@ fn render_chain(f: &mut ratatui::Frame, area: Rect, snap: &Snapshot) {
         kv("finality_lag", head.saturating_sub(finalized).to_string()),
         kv("epoch", epoch.to_string()),
         kv("base_fee", base_fee.to_string()),
-        kv("last_block", format!("slot={} txs={} gas={} elapsed_ms={}", last_slot, last_txs, last_gas, last_ms)),
+        kv(
+            "last_block",
+            format!(
+                "slot={} txs={} gas={} elapsed_ms={}",
+                last_slot, last_txs, last_gas, last_ms
+            ),
+        ),
         kv("since_last", format!("{} ms", since_last_block)),
     ];
-    let p = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" chain "),
-    );
+    let p = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" chain "));
     f.render_widget(p, area);
 }
 
@@ -258,20 +262,11 @@ fn render_mempool(f: &mut ratatui::Frame, area: Rect, snap: &Snapshot) {
         kv("plaintext", plain.to_string()),
         kv("encrypted", enc.to_string()),
     ];
-    let p = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" mempool "),
-    );
+    let p = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" mempool "));
     f.render_widget(p, area);
 }
 
-fn render_throughput(
-    f: &mut ratatui::Frame,
-    area: Rect,
-    snap: &Snapshot,
-    rates: &Rates,
-) {
+fn render_throughput(f: &mut ratatui::Frame, area: Rect, snap: &Snapshot, rates: &Rates) {
     let blocks_total = snap.blocks_processed_total.load(Ordering::Relaxed);
     let txs_total = snap.txs_committed_total.load(Ordering::Relaxed);
     let accepts = snap.rpc_accepts_total.load(Ordering::Relaxed);
@@ -286,20 +281,14 @@ fn render_throughput(
         kv("txs_total", txs_total.to_string()),
         kv("rpc_total", format!("{} ok / {} err", accepts, rejects)),
     ];
-    let p = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" throughput "),
-    );
+    let p =
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" throughput "));
     f.render_widget(p, area);
 }
 
 fn kv(k: &str, v: String) -> Line<'static> {
     Line::from(vec![
-        Span::styled(
-            format!("  {:<18}", k),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(format!("  {:<18}", k), Style::default().fg(Color::DarkGray)),
         Span::raw(v),
     ])
 }

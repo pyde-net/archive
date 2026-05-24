@@ -812,7 +812,10 @@ mod tests {
 
         let tx = make_enc_tx(&pk, 50_000, 0);
         pool.add_unverified_for_devnet(tx.clone()).unwrap();
-        assert_eq!(pool.add_unverified_for_devnet(tx), Err(MempoolError::Duplicate));
+        assert_eq!(
+            pool.add_unverified_for_devnet(tx),
+            Err(MempoolError::Duplicate)
+        );
     }
 
     #[test]
@@ -822,7 +825,10 @@ mod tests {
         pool.set_current_block(200);
 
         let tx = make_enc_tx_with_deadline(&pk, 50_000, 0, 100); // expired
-        assert_eq!(pool.add_unverified_for_devnet(tx), Err(MempoolError::Expired));
+        assert_eq!(
+            pool.add_unverified_for_devnet(tx),
+            Err(MempoolError::Expired)
+        );
     }
 
     #[test]
@@ -831,7 +837,10 @@ mod tests {
         let mut pool = Mempool::new();
 
         let tx = make_enc_tx(&pk, 20_999, 0); // below 21K
-        assert_eq!(pool.add_unverified_for_devnet(tx), Err(MempoolError::GasTooLow));
+        assert_eq!(
+            pool.add_unverified_for_devnet(tx),
+            Err(MempoolError::GasTooLow)
+        );
     }
 
     #[test]
@@ -840,7 +849,10 @@ mod tests {
         let mut pool = Mempool::new();
 
         let tx = make_enc_tx(&pk, 2_000_000_000, 0); // exceeds GAS_CEILING
-        assert_eq!(pool.add_unverified_for_devnet(tx), Err(MempoolError::GasTooHigh));
+        assert_eq!(
+            pool.add_unverified_for_devnet(tx),
+            Err(MempoolError::GasTooHigh)
+        );
     }
 
     #[test]
@@ -864,7 +876,10 @@ mod tests {
             &pk,
         )
         .unwrap();
-        assert_eq!(pool.add_unverified_for_devnet(tx), Err(MempoolError::InvalidSignature));
+        assert_eq!(
+            pool.add_unverified_for_devnet(tx),
+            Err(MempoolError::InvalidSignature)
+        );
     }
 
     #[test]
@@ -888,7 +903,10 @@ mod tests {
             &pk,
         )
         .unwrap();
-        assert_eq!(pool.add_unverified_for_devnet(tx), Err(MempoolError::MissingAccessList));
+        assert_eq!(
+            pool.add_unverified_for_devnet(tx),
+            Err(MempoolError::MissingAccessList)
+        );
     }
 
     // ========== Task 0521: Eviction when full ==========
@@ -899,13 +917,17 @@ mod tests {
         let mut pool = Mempool::with_capacity(3);
 
         // Fill pool: nonce 0 (oldest), 1, 2
-        pool.add_unverified_for_devnet(make_enc_tx(&pk, 30_000, 0)).unwrap();
-        pool.add_unverified_for_devnet(make_enc_tx(&pk, 40_000, 1)).unwrap();
-        pool.add_unverified_for_devnet(make_enc_tx(&pk, 50_000, 2)).unwrap();
+        pool.add_unverified_for_devnet(make_enc_tx(&pk, 30_000, 0))
+            .unwrap();
+        pool.add_unverified_for_devnet(make_enc_tx(&pk, 40_000, 1))
+            .unwrap();
+        pool.add_unverified_for_devnet(make_enc_tx(&pk, 50_000, 2))
+            .unwrap();
         assert_eq!(pool.len(), 3);
 
         // Add new tx → evicts oldest (nonce 0, gas 30K)
-        pool.add_unverified_for_devnet(make_enc_tx(&pk, 60_000, 3)).unwrap();
+        pool.add_unverified_for_devnet(make_enc_tx(&pk, 60_000, 3))
+            .unwrap();
         assert_eq!(pool.len(), 3);
 
         // Oldest (30K) should be gone, newest (60K) should be present
@@ -920,9 +942,12 @@ mod tests {
         let pk = make_pk();
         let mut pool = Mempool::new();
 
-        pool.add_unverified_for_devnet(make_enc_tx(&pk, 30_000, 0)).unwrap();
-        pool.add_unverified_for_devnet(make_enc_tx(&pk, 60_000, 1)).unwrap();
-        pool.add_unverified_for_devnet(make_enc_tx(&pk, 45_000, 2)).unwrap();
+        pool.add_unverified_for_devnet(make_enc_tx(&pk, 30_000, 0))
+            .unwrap();
+        pool.add_unverified_for_devnet(make_enc_tx(&pk, 60_000, 1))
+            .unwrap();
+        pool.add_unverified_for_devnet(make_enc_tx(&pk, 45_000, 2))
+            .unwrap();
 
         let txs = pool.in_arrival_order();
         assert_eq!(txs[0].gas_limit, 30_000); // first in
@@ -937,9 +962,12 @@ mod tests {
         let pk = make_pk();
         let mut pool = Mempool::new();
 
-        pool.add_unverified_for_devnet(make_enc_tx(&pk, 50_000, 0)).unwrap();
-        pool.add_unverified_for_devnet(make_enc_tx(&pk, 60_000, 1)).unwrap();
-        pool.add_unverified_for_devnet(make_enc_tx(&pk, 40_000, 2)).unwrap();
+        pool.add_unverified_for_devnet(make_enc_tx(&pk, 50_000, 0))
+            .unwrap();
+        pool.add_unverified_for_devnet(make_enc_tx(&pk, 60_000, 1))
+            .unwrap();
+        pool.add_unverified_for_devnet(make_enc_tx(&pk, 40_000, 2))
+            .unwrap();
 
         // Block gas limit of 100K → picks 60K + 40K (or 60K + 50K... highest first)
         let selected = pool.select_for_block(100_000, usize::MAX, 0);
@@ -955,7 +983,8 @@ mod tests {
 
         pool.add_unverified_for_devnet(make_enc_tx_with_deadline(&pk, 50_000, 0, 200))
             .unwrap();
-        pool.add_unverified_for_devnet(make_enc_tx(&pk, 60_000, 1)).unwrap(); // no deadline
+        pool.add_unverified_for_devnet(make_enc_tx(&pk, 60_000, 1))
+            .unwrap(); // no deadline
 
         // At slot 300, first tx is expired
         let selected = pool.select_for_block(1_000_000, usize::MAX, 300);
@@ -974,7 +1003,8 @@ mod tests {
         // pool has the test-relevant txs.
         pool.set_rate_limits(1_000, 1_000);
         for nonce in 0..5 {
-            pool.add_unverified_for_devnet(make_enc_tx(&pk, 30_000, nonce)).unwrap();
+            pool.add_unverified_for_devnet(make_enc_tx(&pk, 30_000, nonce))
+                .unwrap();
         }
         // Gas room = 5×30k = 150k well under 1M, count cap = 2
         let selected = pool.select_for_block(1_000_000, 2, 0);
@@ -992,7 +1022,8 @@ mod tests {
         pool.set_rate_limits(10_000, 10_000);
         // Add more than the cap so the cap is the binding constraint.
         for nonce in 0..(MAX_ENCRYPTED_TXS_PER_BLOCK as u64 + 5) {
-            pool.add_unverified_for_devnet(make_enc_tx(&pk, 30_000, nonce)).unwrap();
+            pool.add_unverified_for_devnet(make_enc_tx(&pk, 30_000, nonce))
+                .unwrap();
         }
         let selected = pool.select_for_block(1_000_000_000, MAX_ENCRYPTED_TXS_PER_BLOCK, 0);
         assert_eq!(selected.len(), MAX_ENCRYPTED_TXS_PER_BLOCK);
@@ -1100,7 +1131,8 @@ mod tests {
 
         pool.add_unverified_for_devnet(make_enc_tx_with_deadline(&pk, 50_000, 0, 100))
             .unwrap();
-        pool.add_unverified_for_devnet(make_enc_tx(&pk, 60_000, 1)).unwrap();
+        pool.add_unverified_for_devnet(make_enc_tx(&pk, 60_000, 1))
+            .unwrap();
         assert_eq!(pool.len(), 2);
 
         pool.set_current_block(200);
@@ -1272,11 +1304,14 @@ mod tests {
 
         let sender = derive_eoa_address(b"rate-sender");
         for n in 0..3 {
-            pool.add_unverified_for_devnet(make_enc_tx_from(&pk, sender, n)).unwrap();
+            pool.add_unverified_for_devnet(make_enc_tx_from(&pk, sender, n))
+                .unwrap();
         }
 
         // Fourth submission within the same window → rate-limited.
-        let err = pool.add_unverified_for_devnet(make_enc_tx_from(&pk, sender, 3)).unwrap_err();
+        let err = pool
+            .add_unverified_for_devnet(make_enc_tx_from(&pk, sender, 3))
+            .unwrap_err();
         assert_eq!(err, MempoolError::RateLimitExceeded);
         assert_eq!(pool.len(), 3);
     }
@@ -1290,13 +1325,16 @@ mod tests {
 
         let sender = derive_eoa_address(b"rolling-sender");
         set_test_clock_ms(100);
-        pool.add_unverified_for_devnet(make_enc_tx_from(&pk, sender, 0)).unwrap();
-        pool.add_unverified_for_devnet(make_enc_tx_from(&pk, sender, 1)).unwrap();
+        pool.add_unverified_for_devnet(make_enc_tx_from(&pk, sender, 0))
+            .unwrap();
+        pool.add_unverified_for_devnet(make_enc_tx_from(&pk, sender, 1))
+            .unwrap();
 
         // Still within window — third is rejected.
         set_test_clock_ms(500);
         assert_eq!(
-            pool.add_unverified_for_devnet(make_enc_tx_from(&pk, sender, 2)).unwrap_err(),
+            pool.add_unverified_for_devnet(make_enc_tx_from(&pk, sender, 2))
+                .unwrap_err(),
             MempoolError::RateLimitExceeded,
         );
 
@@ -1326,7 +1364,8 @@ mod tests {
 
         // 4th concurrently → blocked.
         assert_eq!(
-            pool.add_unverified_for_devnet(make_enc_tx_from(&pk, sender, 3)).unwrap_err(),
+            pool.add_unverified_for_devnet(make_enc_tx_from(&pk, sender, 3))
+                .unwrap_err(),
             MempoolError::TooManyConcurrentFromSender,
         );
 
@@ -1350,17 +1389,21 @@ mod tests {
         let alice = derive_eoa_address(b"alice");
         let bob = derive_eoa_address(b"bob");
 
-        pool.add_unverified_for_devnet(make_enc_tx_from(&pk, alice, 0)).unwrap();
-        pool.add_unverified_for_devnet(make_enc_tx_from(&pk, alice, 1)).unwrap();
+        pool.add_unverified_for_devnet(make_enc_tx_from(&pk, alice, 0))
+            .unwrap();
+        pool.add_unverified_for_devnet(make_enc_tx_from(&pk, alice, 1))
+            .unwrap();
 
         // Alice is at her rate cap, but Bob still has headroom.
         assert_eq!(
-            pool.add_unverified_for_devnet(make_enc_tx_from(&pk, alice, 2)).unwrap_err(),
+            pool.add_unverified_for_devnet(make_enc_tx_from(&pk, alice, 2))
+                .unwrap_err(),
             MempoolError::RateLimitExceeded,
         );
         pool.add_unverified_for_devnet(make_enc_tx_from(&pk, bob, 0))
             .expect("bob is unaffected by alice's cap");
-        pool.add_unverified_for_devnet(make_enc_tx_from(&pk, bob, 1)).unwrap();
+        pool.add_unverified_for_devnet(make_enc_tx_from(&pk, bob, 1))
+            .unwrap();
     }
 
     // ========== Task 028: FALCON-pubkey binding on submit ==========

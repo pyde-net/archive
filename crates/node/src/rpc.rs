@@ -1728,10 +1728,9 @@ pub async fn start_rpc_server(
     // is a token bucket per `ConnectionId`; see
     // `crate::rpc_rate_limit` for the per-second / burst constants.
     let rate_limit_state = crate::rpc_rate_limit::RpcRateLimitState::new();
-    let rpc_middleware = RpcServiceBuilder::new()
-        .layer(crate::rpc_rate_limit::RpcRateLimitLayer::new(
-            rate_limit_state,
-        ));
+    let rpc_middleware = RpcServiceBuilder::new().layer(
+        crate::rpc_rate_limit::RpcRateLimitLayer::new(rate_limit_state),
+    );
 
     let server = Server::builder()
         .max_request_body_size(MAX_REQUEST_BODY_BYTES)

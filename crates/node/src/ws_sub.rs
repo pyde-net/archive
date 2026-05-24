@@ -169,7 +169,10 @@ async fn handle_connection(
                                     // newHeads at ~2.5/s never trips the
                                     // 50/s cap in practice.
                                     if !rl.try_consume() {
-                                        debug!(sub_id, "newHeads sub rate-limit: dropped event (TPL-932)");
+                                        debug!(
+                                            sub_id,
+                                            "newHeads sub rate-limit: dropped event (TPL-932)"
+                                        );
                                         continue;
                                     }
                                     let notif = serde_json::json!({
@@ -243,7 +246,10 @@ async fn handle_connection(
                                     // channel. Filter-pass is checked first
                                     // so dropped logs don't burn tokens.
                                     if !rl.try_consume() {
-                                        debug!(sub_id, "logs sub rate-limit: dropped event (TPL-932)");
+                                        debug!(
+                                            sub_id,
+                                            "logs sub rate-limit: dropped event (TPL-932)"
+                                        );
                                         continue;
                                     }
                                     let notif = serde_json::json!({

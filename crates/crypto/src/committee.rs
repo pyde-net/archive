@@ -210,7 +210,13 @@ mod tests {
         let seed = make_seed(6);
         let (output, proof) = compute_committee_score(&pk, &sk, 10, &seed).expect("score");
         assert!(!verify_committee_score(&pk, 11, &seed, &output, &proof));
-        assert!(!verify_committee_score(&pk, 10, &make_seed(99), &output, &proof));
+        assert!(!verify_committee_score(
+            &pk,
+            10,
+            &make_seed(99),
+            &output,
+            &proof
+        ));
     }
 
     #[test]
@@ -218,10 +224,7 @@ mod tests {
         let (pk, sk) = falcon_keygen().expect("falcon");
         let seed = make_seed(8);
         let (output, _) = compute_committee_score(&pk, &sk, 1, &seed).expect("score");
-        assert_eq!(
-            vrf_output_to_score(&output),
-            vrf_output_to_score(&output)
-        );
+        assert_eq!(vrf_output_to_score(&output), vrf_output_to_score(&output));
     }
 
     fn fresh_reveal(index: usize, epoch: u64, seed: &[u8; 32]) -> CommitteeReveal {
@@ -269,8 +272,8 @@ mod tests {
         let stolen = CommitteeReveal {
             validator_index: 3,
             vrf_pk: fresh_reveal(99, epoch, &seed).vrf_pk, // a different pk
-            output: a.output.clone(),                       // copy a's output
-            proof: a.proof.clone(),                         // copy a's proof
+            output: a.output.clone(),                      // copy a's output
+            proof: a.proof.clone(),                        // copy a's proof
         };
         let committee = select_top_k_by_vrf(&[a, stolen], epoch, &seed, 5);
         // The "stolen" reveal can't verify under the swapped pk, so

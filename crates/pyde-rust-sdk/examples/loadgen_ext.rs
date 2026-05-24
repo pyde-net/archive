@@ -31,8 +31,8 @@
 
 use pyde_rust_sdk::*;
 use pyde_tx::types::{FeePayer, Transaction, TransactionType};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn env_or(name: &str, default: &str) -> String {
@@ -83,7 +83,10 @@ async fn main() {
 
     // Build wallets + fetch starting state.
     let p = Arc::new(Provider::new(&rpc_url));
-    let chain_id = p.get_chain_id().await.expect("get_chain_id failed — RPC unreachable?");
+    let chain_id = p
+        .get_chain_id()
+        .await
+        .expect("get_chain_id failed — RPC unreachable?");
     println!("connected to chain_id={chain_id}");
 
     let mut wallets: Vec<Wallet> = Vec::with_capacity(n_senders);
@@ -96,7 +99,10 @@ async fn main() {
             .await
             .unwrap_or_else(|e| panic!("get_nonce[{i}]: {e:?}"));
         let bal = p.get_balance(w.address()).await.unwrap_or(0);
-        println!("  sender[{i}] addr=0x{} starting_nonce={nonce} balance={bal}", hex::encode(w.address()));
+        println!(
+            "  sender[{i}] addr=0x{} starting_nonce={nonce} balance={bal}",
+            hex::encode(w.address())
+        );
         wallets.push(w);
         nonces.push(nonce);
     }
@@ -113,12 +119,12 @@ async fn main() {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(1_000_000_000_000_000_000u128); // 1 PYDE
-        // Pick funder: if PYDE_FAUCET_KEY is set, load that raw FALCON
-        // private-key file (the testnet faucet, typically 1000+ PYDE
-        // balance). Otherwise fall back to the last loaded account.
+                                                       // Pick funder: if PYDE_FAUCET_KEY is set, load that raw FALCON
+                                                       // private-key file (the testnet faucet, typically 1000+ PYDE
+                                                       // balance). Otherwise fall back to the last loaded account.
         let (funder, mut funder_nonce) = if let Ok(path) = std::env::var("PYDE_FAUCET_KEY") {
-            let mut raw = std::fs::read(&path)
-                .unwrap_or_else(|e| panic!("read faucet key {path}: {e}"));
+            let mut raw =
+                std::fs::read(&path).unwrap_or_else(|e| panic!("read faucet key {path}: {e}"));
             // The faucet.key file written by `pyde testnet` is framed
             // as `[u32 LE pubkey_len=897][pubkey 897][secret 1281]` =
             // 2182 bytes. `Wallet::from_private_key` expects the
@@ -200,7 +206,10 @@ async fn main() {
                     }
                 }
             }
-            println!("  funded batch {}..{end}: ok={ok} err={err} (sleeping 3s for inclusion)", i);
+            println!(
+                "  funded batch {}..{end}: ok={ok} err={err} (sleeping 3s for inclusion)",
+                i
+            );
             tokio::time::sleep(Duration::from_secs(3)).await;
             i = end;
         }
@@ -233,8 +242,10 @@ async fn main() {
             let e = r_errors.load(Ordering::Relaxed);
             let delta = s - last;
             last = s;
-            println!("  [t+{:>4}s] submitted={s} ({delta} in last 10s) errors={e}",
-                start.elapsed().as_secs());
+            println!(
+                "  [t+{:>4}s] submitted={s} ({delta} in last 10s) errors={e}",
+                start.elapsed().as_secs()
+            );
         }
     });
 

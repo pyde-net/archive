@@ -1040,8 +1040,10 @@ pub fn generate_testnet(
     // keypairs that follow — this binary holds all secrets briefly
     // and writes them out per node directory; the operator is
     // expected to distribute and discard.
-    let mut kem_keypairs: Vec<(pyde_crypto::kyber::KyberPublicKey, pyde_crypto::kyber::KyberSecretKey)> =
-        Vec::with_capacity(num_validators);
+    let mut kem_keypairs: Vec<(
+        pyde_crypto::kyber::KyberPublicKey,
+        pyde_crypto::kyber::KyberSecretKey,
+    )> = Vec::with_capacity(num_validators);
     for _ in 0..num_validators {
         let kp = pyde_crypto::kyber::kyber_keygen()
             .map_err(|e| format!("validator kem keygen failed: {}", e))?;
@@ -1240,8 +1242,7 @@ pub fn generate_testnet(
         // share-receipt during DKG.
         let kem_pk_bytes = kem_keypairs[i].0.as_bytes();
         let kem_sk_bytes = kem_keypairs[i].1.as_bytes();
-        let mut kem_buf =
-            Vec::with_capacity(4 + kem_pk_bytes.len() + kem_sk_bytes.len());
+        let mut kem_buf = Vec::with_capacity(4 + kem_pk_bytes.len() + kem_sk_bytes.len());
         kem_buf.extend_from_slice(&(kem_pk_bytes.len() as u32).to_le_bytes());
         kem_buf.extend_from_slice(kem_pk_bytes);
         kem_buf.extend_from_slice(kem_sk_bytes);

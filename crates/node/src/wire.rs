@@ -443,9 +443,7 @@ pub fn decode_reshare_state(data: &[u8]) -> Result<ReshareState, &'static str> {
 /// occur with a well-formed schedule). Returns an empty vec when the
 /// schedule has more groups than `u16::MAX` can label, in which case
 /// the receiver falls back to single-group sequential apply.
-pub fn schedule_to_group_ids(
-    schedule: &pyde_tx::parallel::ExecutionSchedule,
-) -> Vec<u16> {
+pub fn schedule_to_group_ids(schedule: &pyde_tx::parallel::ExecutionSchedule) -> Vec<u16> {
     if schedule.groups.len() > u16::MAX as usize {
         return Vec::new();
     }
@@ -467,9 +465,7 @@ pub fn schedule_to_group_ids(
 /// is deterministic but does not have to match the original group
 /// ordering — execution semantics depend only on the partition, not
 /// on group order.
-pub fn group_ids_to_schedule(
-    group_ids: &[u16],
-) -> pyde_tx::parallel::ExecutionSchedule {
+pub fn group_ids_to_schedule(group_ids: &[u16]) -> pyde_tx::parallel::ExecutionSchedule {
     use std::collections::BTreeMap;
     let mut by_group: BTreeMap<u16, Vec<usize>> = BTreeMap::new();
     for (tx_idx, &gid) in group_ids.iter().enumerate() {
@@ -1992,7 +1988,7 @@ mod tests {
         bytes.extend_from_slice(&0u32.to_le_bytes()); // header bytes len
         bytes.extend_from_slice(&0u64.to_le_bytes()); // nonce
         bytes.extend_from_slice(&3u32.to_le_bytes()); // 3 short ids
-        bytes.extend_from_slice(&[0u8; 8 * 3]);       // short ids
+        bytes.extend_from_slice(&[0u8; 8 * 3]); // short ids
         bytes.extend_from_slice(&0u16.to_le_bytes()); // 0 prefilled
         bytes.extend_from_slice(&2u32.to_le_bytes()); // 2 group_ids (mismatch)
         bytes.extend_from_slice(&0u16.to_le_bytes());
@@ -2009,9 +2005,15 @@ mod tests {
         // if group ordering or label values differ.
         let schedule = pyde_tx::parallel::ExecutionSchedule {
             groups: vec![
-                pyde_tx::parallel::ExecutionGroup { tx_indices: vec![0, 2, 5] },
-                pyde_tx::parallel::ExecutionGroup { tx_indices: vec![1, 4] },
-                pyde_tx::parallel::ExecutionGroup { tx_indices: vec![3] },
+                pyde_tx::parallel::ExecutionGroup {
+                    tx_indices: vec![0, 2, 5],
+                },
+                pyde_tx::parallel::ExecutionGroup {
+                    tx_indices: vec![1, 4],
+                },
+                pyde_tx::parallel::ExecutionGroup {
+                    tx_indices: vec![3],
+                },
             ],
             total_txs: 6,
         };
@@ -2154,7 +2156,7 @@ mod tests {
         let mut bytes = vec![CONSENSUS_STATE_VERSION];
         bytes.extend_from_slice(&0u64.to_le_bytes()); // current_slot
         bytes.extend_from_slice(&0u64.to_le_bytes()); // current_epoch
-        // QC: slot, hash, bitmap, sig_count = 0 (no signatures)
+                                                      // QC: slot, hash, bitmap, sig_count = 0 (no signatures)
         bytes.extend_from_slice(&0u64.to_le_bytes());
         bytes.extend_from_slice(&[0u8; 32]);
         bytes.extend_from_slice(&0u128.to_le_bytes());

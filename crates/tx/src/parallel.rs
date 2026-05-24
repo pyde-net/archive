@@ -42,16 +42,12 @@ use std::collections::{HashMap, HashSet};
 /// step (see `pyde_tx::pipeline::apply_block_fees`).
 fn implicit_writes(tx: &Transaction) -> Option<Vec<(Address, [u8; 32])>> {
     match tx.tx_type {
-        TransactionType::Standard
-        | TransactionType::Deploy
-        | TransactionType::RegisterPubkey => {
-            let from_balance: [u8; 32] =
-                pyde_state::keys::balance_key(&tx.from).into();
+        TransactionType::Standard | TransactionType::Deploy | TransactionType::RegisterPubkey => {
+            let from_balance: [u8; 32] = pyde_state::keys::balance_key(&tx.from).into();
             let from_nonce: [u8; 32] = pyde_state::keys::nonce_key(&tx.from).into();
             let mut writes = vec![(tx.from, from_balance), (tx.from, from_nonce)];
             if matches!(tx.tx_type, TransactionType::Standard) && tx.to != [0u8; 32] {
-                let to_balance: [u8; 32] =
-                    pyde_state::keys::balance_key(&tx.to).into();
+                let to_balance: [u8; 32] = pyde_state::keys::balance_key(&tx.to).into();
                 writes.push((tx.to, to_balance));
             }
             Some(writes)

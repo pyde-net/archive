@@ -505,9 +505,7 @@ impl PersistentJMT {
                 tree.get_root_hash(v)
                     .map_err(|e| format!("recover root: {}", e))?
             }
-            None => {
-                RootHash(JellyfishMerkleTree::<JmtRocksStore, Blake3JmtHasher>::EMPTY_ROOT.0)
-            }
+            None => RootHash(JellyfishMerkleTree::<JmtRocksStore, Blake3JmtHasher>::EMPTY_ROOT.0),
         };
 
         // When no version exists, we haven't committed anything yet.

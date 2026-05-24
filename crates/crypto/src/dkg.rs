@@ -30,7 +30,9 @@ use alloc::vec::Vec;
 use p3_goldilocks::Goldilocks;
 use subtle::ConstantTimeEq;
 
-use crate::falcon::{falcon_sign, falcon_verify, FalconPublicKey, FalconSecretKey, FalconSignature};
+use crate::falcon::{
+    falcon_sign, falcon_verify, FalconPublicKey, FalconSecretKey, FalconSignature,
+};
 use crate::kyber::{
     kyber_decapsulate, kyber_encapsulate, KyberCiphertext, KyberPublicKey, KyberSecretKey,
     SharedSecret,
@@ -100,8 +102,7 @@ impl ShareRow {
         if bytes.len() != Self::WIRE_LEN {
             return None;
         }
-        let receiver_index =
-            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+        let receiver_index = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
         let mut values = [Goldilocks::default(); SEED_ELEMENTS];
         for i in 0..SEED_ELEMENTS {
             let off = 4 + i * 8;
@@ -132,9 +133,8 @@ impl ShareRow {
     /// contributor=X can't be re-presented as a leaf of epoch=B's
     /// tree even if the byte values coincide.
     pub fn leaf_hash(&self, epoch: u64, from_index: usize) -> [u8; 32] {
-        let mut buf = Vec::with_capacity(
-            DKG_MERKLE_LEAF_DOMAIN.len() + 8 + 4 + 4 + 8 * SEED_ELEMENTS,
-        );
+        let mut buf =
+            Vec::with_capacity(DKG_MERKLE_LEAF_DOMAIN.len() + 8 + 4 + 4 + 8 * SEED_ELEMENTS);
         buf.extend_from_slice(DKG_MERKLE_LEAF_DOMAIN);
         buf.extend_from_slice(&epoch.to_le_bytes());
         buf.extend_from_slice(&(from_index as u32).to_le_bytes());
@@ -375,11 +375,9 @@ impl DkgCommitment {
         let epoch = u64::from_le_bytes([
             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ]);
-        let from_index =
-            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
+        let from_index = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
         let n = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as usize;
-        let threshold =
-            u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]) as usize;
+        let threshold = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]) as usize;
         let mut merkle_root = [0u8; 32];
         merkle_root.copy_from_slice(&bytes[20..52]);
         let sig_len = u32::from_le_bytes([bytes[52], bytes[53], bytes[54], bytes[55]]) as usize;
@@ -419,9 +417,8 @@ fn dkg_aead_keystream(
     let mut out = Vec::with_capacity(len);
     let mut counter: u64 = 0;
     while out.len() < len {
-        let mut input = Vec::with_capacity(
-            DKG_AEAD_KS_DOMAIN.len() + 32 + kyber_ct.len() + 8 + 4 + 4 + 8,
-        );
+        let mut input =
+            Vec::with_capacity(DKG_AEAD_KS_DOMAIN.len() + 32 + kyber_ct.len() + 8 + 4 + 4 + 8);
         input.extend_from_slice(DKG_AEAD_KS_DOMAIN);
         input.extend_from_slice(ss.as_bytes());
         input.extend_from_slice(kyber_ct);
@@ -480,8 +477,7 @@ pub struct DkgShareEnvelope {
 impl DkgShareEnvelope {
     /// Wire format: `kyber_ct_len(4 LE) || kyber_ct || ciphertext_len(4 LE) || ciphertext || mac(32)`.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out =
-            Vec::with_capacity(4 + self.kyber_ct.len() + 4 + self.ciphertext.len() + 32);
+        let mut out = Vec::with_capacity(4 + self.kyber_ct.len() + 4 + self.ciphertext.len() + 32);
         out.extend_from_slice(&(self.kyber_ct.len() as u32).to_le_bytes());
         out.extend_from_slice(&self.kyber_ct);
         out.extend_from_slice(&(self.ciphertext.len() as u32).to_le_bytes());
@@ -716,9 +712,7 @@ impl DkgComplaint {
     pub fn signing_preimage(&self) -> Vec<u8> {
         let envelope_hash = poseidon2_hash(&self.envelope.to_bytes()).to_bytes();
         let proof_hash = poseidon2_hash(&self.merkle_proof.to_bytes()).to_bytes();
-        let mut buf = Vec::with_capacity(
-            DKG_COMPLAINT_SIG_DOMAIN.len() + 8 + 4 + 4 + 32 + 32 + 32,
-        );
+        let mut buf = Vec::with_capacity(DKG_COMPLAINT_SIG_DOMAIN.len() + 8 + 4 + 4 + 32 + 32 + 32);
         buf.extend_from_slice(DKG_COMPLAINT_SIG_DOMAIN);
         buf.extend_from_slice(&self.epoch.to_le_bytes());
         buf.extend_from_slice(&(self.from_index as u32).to_le_bytes());
@@ -769,12 +763,10 @@ impl DkgComplaint {
         let epoch = u64::from_le_bytes([
             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ]);
-        let from_index =
-            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
+        let from_index = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
         let against_index =
             u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]) as usize;
-        let env_len =
-            u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]) as usize;
+        let env_len = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]) as usize;
         let env_end = 20 + env_len;
         if bytes.len() < env_end + 32 + 4 {
             return None;
@@ -924,8 +916,7 @@ fn sample_goldilocks(
         if attempt as u32 >= MAX_REJECTION_RETRIES {
             return Err("DKG sampling exceeded rejection-retry budget");
         }
-        let mut input =
-            Vec::with_capacity(domain.len() + 32 + 4 + 4 + 4 + 8);
+        let mut input = Vec::with_capacity(domain.len() + 32 + 4 + 4 + 4 + 8);
         input.extend_from_slice(domain);
         input.extend_from_slice(rng_seed);
         input.extend_from_slice(&(from_index as u32).to_le_bytes());
@@ -1107,13 +1098,7 @@ pub fn generate_dkg_contribution(
     // Sample the contributor's 8-element secret seed.
     let mut secret = [Goldilocks::default(); SEED_ELEMENTS];
     for k in 0..SEED_ELEMENTS {
-        secret[k] = sample_goldilocks(
-            DKG_SECRET_SEED_DOMAIN,
-            rng_seed,
-            from_index,
-            k,
-            0,
-        )?;
+        secret[k] = sample_goldilocks(DKG_SECRET_SEED_DOMAIN, rng_seed, from_index, k, 0)?;
     }
 
     // Per-element Shamir split. `ys[k]` is the length-`n` vector
@@ -1122,12 +1107,7 @@ pub fn generate_dkg_contribution(
     let mut ys: Vec<Vec<Goldilocks>> = Vec::with_capacity(SEED_ELEMENTS);
     for k in 0..SEED_ELEMENTS {
         ys.push(dkg_shamir_split_y(
-            secret[k],
-            n,
-            threshold,
-            rng_seed,
-            from_index,
-            k,
+            secret[k], n, threshold, rng_seed, from_index, k,
         )?);
     }
 
@@ -1149,8 +1129,7 @@ pub fn generate_dkg_contribution(
 
     // Merkle root + Falcon-signed commitment.
     let merkle_root = compute_merkle_root(&leaves, epoch, from_index);
-    let mut commitment =
-        DkgCommitment::new_unsigned(epoch, from_index, n, threshold, merkle_root);
+    let mut commitment = DkgCommitment::new_unsigned(epoch, from_index, n, threshold, merkle_root);
     commitment.sign(falcon_sk)?;
 
     // Pre-compute per-recipient Merkle proofs.
@@ -1336,12 +1315,19 @@ mod tests {
         let from_index = 2;
         let n = 5;
         let rows: Vec<ShareRow> = (1..=n).map(|i| make_row(i, 1000 + i as u64)).collect();
-        let leaves: Vec<[u8; 32]> = rows.iter().map(|r| r.leaf_hash(epoch, from_index)).collect();
+        let leaves: Vec<[u8; 32]> = rows
+            .iter()
+            .map(|r| r.leaf_hash(epoch, from_index))
+            .collect();
         let root = compute_merkle_root(&leaves, epoch, from_index);
 
         for (i, leaf) in leaves.iter().enumerate() {
             let proof = merkle_proof(&leaves, i, epoch, from_index).expect("proof exists");
-            assert!(verify_merkle_proof(&root, leaf, &proof), "proof {} verifies", i);
+            assert!(
+                verify_merkle_proof(&root, leaf, &proof),
+                "proof {} verifies",
+                i
+            );
             // Wire roundtrip.
             let encoded = proof.to_bytes();
             let decoded = MerkleProof::from_bytes(&encoded).expect("decode proof");
@@ -1355,7 +1341,10 @@ mod tests {
         let epoch = 1;
         let from_index = 1;
         let rows: Vec<ShareRow> = (1..=8).map(|i| make_row(i, 100 + i as u64)).collect();
-        let leaves: Vec<[u8; 32]> = rows.iter().map(|r| r.leaf_hash(epoch, from_index)).collect();
+        let leaves: Vec<[u8; 32]> = rows
+            .iter()
+            .map(|r| r.leaf_hash(epoch, from_index))
+            .collect();
         let root = compute_merkle_root(&leaves, epoch, from_index);
 
         let proof = merkle_proof(&leaves, 3, epoch, from_index).expect("proof");
@@ -1370,7 +1359,10 @@ mod tests {
         let epoch = 1;
         let from_index = 1;
         let rows: Vec<ShareRow> = (1..=8).map(|i| make_row(i, 200 + i as u64)).collect();
-        let leaves: Vec<[u8; 32]> = rows.iter().map(|r| r.leaf_hash(epoch, from_index)).collect();
+        let leaves: Vec<[u8; 32]> = rows
+            .iter()
+            .map(|r| r.leaf_hash(epoch, from_index))
+            .collect();
         let root = compute_merkle_root(&leaves, epoch, from_index);
 
         // Generate proof for index 3 and present leaf 5 with it.
@@ -1434,7 +1426,10 @@ mod tests {
         let epoch = 11;
         let from_index = 4;
         let rows: Vec<ShareRow> = (1..=5).map(|i| make_row(i, 7 + i as u64)).collect();
-        let leaves: Vec<[u8; 32]> = rows.iter().map(|r| r.leaf_hash(epoch, from_index)).collect();
+        let leaves: Vec<[u8; 32]> = rows
+            .iter()
+            .map(|r| r.leaf_hash(epoch, from_index))
+            .collect();
         let root_5 = compute_merkle_root(&leaves, epoch, from_index);
 
         // Build the same tree explicitly with the empties.
@@ -1450,13 +1445,7 @@ mod tests {
     #[test]
     fn commitment_sign_and_verify() {
         let (pk, sk) = falcon_keygen().expect("falcon_keygen");
-        let mut c = DkgCommitment::new_unsigned(
-            5,
-            2,
-            7,
-            5,
-            [0x42u8; 32],
-        );
+        let mut c = DkgCommitment::new_unsigned(5, 2, 7, 5, [0x42u8; 32]);
         c.sign(&sk).expect("sign");
         assert!(c.verify(&pk));
     }
@@ -1531,7 +1520,10 @@ mod tests {
         let from_index = 7;
         let n = 128usize;
         let rows: Vec<ShareRow> = (1..=n).map(|i| make_row(i, 5000 + i as u64)).collect();
-        let leaves: Vec<[u8; 32]> = rows.iter().map(|r| r.leaf_hash(epoch, from_index)).collect();
+        let leaves: Vec<[u8; 32]> = rows
+            .iter()
+            .map(|r| r.leaf_hash(epoch, from_index))
+            .collect();
         let root = compute_merkle_root(&leaves, epoch, from_index);
 
         for i in [0usize, 1, 63, 64, 127] {
@@ -1651,8 +1643,7 @@ mod tests {
         let plaintext_row = make_row(7, 99);
         let (kct, ss) = kyber_encapsulate(&pk).expect("encap");
         let plaintext = plaintext_row.to_bytes();
-        let keystream =
-            dkg_aead_keystream(&ss, kct.as_bytes(), 1, 1, 3, plaintext.len());
+        let keystream = dkg_aead_keystream(&ss, kct.as_bytes(), 1, 1, 3, plaintext.len());
         let mut ciphertext = Vec::with_capacity(plaintext.len());
         for i in 0..plaintext.len() {
             ciphertext.push(plaintext[i] ^ keystream[i]);
@@ -1753,7 +1744,10 @@ mod tests {
         crate::kyber::KyberSecretKey,
     ) {
         let rows: Vec<ShareRow> = (1..=n).map(|i| make_row(i, 1000 + i as u64)).collect();
-        let leaves: Vec<[u8; 32]> = rows.iter().map(|r| r.leaf_hash(epoch, from_index)).collect();
+        let leaves: Vec<[u8; 32]> = rows
+            .iter()
+            .map(|r| r.leaf_hash(epoch, from_index))
+            .collect();
         let root = compute_merkle_root(&leaves, epoch, from_index);
         let proof = merkle_proof(&leaves, target_recipient - 1, epoch, from_index)
             .expect("merkle proof exists");
@@ -1813,14 +1807,8 @@ mod tests {
         let target = 3;
         let (_rows, root, envelope, ss, proof, c_pk, c_sk, _sk) =
             build_complaint_fixture(epoch, from_index, n, target);
-        let mut complaint = DkgComplaint::new_unsigned(
-            epoch,
-            from_index,
-            target,
-            envelope,
-            ss,
-            proof,
-        );
+        let mut complaint =
+            DkgComplaint::new_unsigned(epoch, from_index, target, envelope, ss, proof);
         complaint.sign(&c_sk).expect("sign");
         assert_eq!(
             verify_complaint(&complaint, &c_pk, &root),
@@ -1838,14 +1826,8 @@ mod tests {
         let target = 3;
         let (_rows, _real_root, envelope, ss, proof, c_pk, c_sk, _sk) =
             build_complaint_fixture(epoch, from_index, 5, target);
-        let mut complaint = DkgComplaint::new_unsigned(
-            epoch,
-            from_index,
-            target,
-            envelope,
-            ss,
-            proof,
-        );
+        let mut complaint =
+            DkgComplaint::new_unsigned(epoch, from_index, target, envelope, ss, proof);
         complaint.sign(&c_sk).expect("sign");
         let bogus_root = [0xAAu8; 32];
         assert_eq!(
@@ -1876,33 +1858,26 @@ mod tests {
         // u64::MAX (which is >= GOLDILOCKS_PRIME so ShareRow
         // rejects it during decode).
         garbage[0..4].copy_from_slice(&(target as u32).to_le_bytes());
-        let keystream =
-            dkg_aead_keystream(&ss, kct.as_bytes(), epoch, from_index, target, garbage.len());
-        let mut ciphertext = Vec::with_capacity(garbage.len());
-        for i in 0..garbage.len() {
-            ciphertext.push(garbage[i] ^ keystream[i]);
-        }
-        let mac = dkg_aead_mac(
+        let keystream = dkg_aead_keystream(
             &ss,
             kct.as_bytes(),
             epoch,
             from_index,
             target,
-            &ciphertext,
+            garbage.len(),
         );
+        let mut ciphertext = Vec::with_capacity(garbage.len());
+        for i in 0..garbage.len() {
+            ciphertext.push(garbage[i] ^ keystream[i]);
+        }
+        let mac = dkg_aead_mac(&ss, kct.as_bytes(), epoch, from_index, target, &ciphertext);
         let envelope = DkgShareEnvelope {
             kyber_ct: kct.to_vec(),
             ciphertext,
             mac,
         };
-        let mut complaint = DkgComplaint::new_unsigned(
-            epoch,
-            from_index,
-            target,
-            envelope,
-            *ss.as_bytes(),
-            proof,
-        );
+        let mut complaint =
+            DkgComplaint::new_unsigned(epoch, from_index, target, envelope, *ss.as_bytes(), proof);
         complaint.sign(&c_sk).expect("sign");
         assert_eq!(
             verify_complaint(&complaint, &c_pk, &root),
@@ -1936,27 +1911,14 @@ mod tests {
         for i in 0..plaintext.len() {
             ciphertext.push(plaintext[i] ^ keystream[i]);
         }
-        let mac = dkg_aead_mac(
-            &ss,
-            kct.as_bytes(),
-            epoch,
-            from_index,
-            target,
-            &ciphertext,
-        );
+        let mac = dkg_aead_mac(&ss, kct.as_bytes(), epoch, from_index, target, &ciphertext);
         let envelope = DkgShareEnvelope {
             kyber_ct: kct.to_vec(),
             ciphertext,
             mac,
         };
-        let mut complaint = DkgComplaint::new_unsigned(
-            epoch,
-            from_index,
-            target,
-            envelope,
-            *ss.as_bytes(),
-            proof,
-        );
+        let mut complaint =
+            DkgComplaint::new_unsigned(epoch, from_index, target, envelope, *ss.as_bytes(), proof);
         complaint.sign(&c_sk).expect("sign");
         assert_eq!(
             verify_complaint(&complaint, &c_pk, &root),
@@ -1975,14 +1937,8 @@ mod tests {
         let (_rows, root, mut envelope, ss, proof, c_pk, c_sk, _sk) =
             build_complaint_fixture(epoch, from_index, 4, target);
         envelope.mac[0] ^= 0xFF;
-        let mut complaint = DkgComplaint::new_unsigned(
-            epoch,
-            from_index,
-            target,
-            envelope,
-            ss,
-            proof,
-        );
+        let mut complaint =
+            DkgComplaint::new_unsigned(epoch, from_index, target, envelope, ss, proof);
         complaint.sign(&c_sk).expect("sign");
         assert_eq!(
             verify_complaint(&complaint, &c_pk, &root),
@@ -2000,14 +1956,8 @@ mod tests {
         let (_rows, root, envelope, _real_ss, proof, c_pk, c_sk, _sk) =
             build_complaint_fixture(epoch, from_index, 4, target);
         let fake_ss = [0xAAu8; 32];
-        let mut complaint = DkgComplaint::new_unsigned(
-            epoch,
-            from_index,
-            target,
-            envelope,
-            fake_ss,
-            proof,
-        );
+        let mut complaint =
+            DkgComplaint::new_unsigned(epoch, from_index, target, envelope, fake_ss, proof);
         complaint.sign(&c_sk).expect("sign");
         assert_eq!(
             verify_complaint(&complaint, &c_pk, &root),
@@ -2023,14 +1973,8 @@ mod tests {
         let (_rows, root, envelope, ss, proof, c_pk_legit, _c_sk_legit, _sk) =
             build_complaint_fixture(epoch, from_index, 4, target);
         let (_pk_attacker, sk_attacker) = falcon_keygen().expect("attacker keys");
-        let mut complaint = DkgComplaint::new_unsigned(
-            epoch,
-            from_index,
-            target,
-            envelope,
-            ss,
-            proof,
-        );
+        let mut complaint =
+            DkgComplaint::new_unsigned(epoch, from_index, target, envelope, ss, proof);
         complaint.sign(&sk_attacker).expect("sign with attacker");
         assert_eq!(
             verify_complaint(&complaint, &c_pk_legit, &root),
@@ -2045,14 +1989,8 @@ mod tests {
         let target = 2;
         let (_rows, root, envelope, ss, proof, c_pk, c_sk, _sk) =
             build_complaint_fixture(epoch, from_index, 4, target);
-        let mut complaint = DkgComplaint::new_unsigned(
-            epoch,
-            from_index,
-            target,
-            envelope,
-            ss,
-            proof,
-        );
+        let mut complaint =
+            DkgComplaint::new_unsigned(epoch, from_index, target, envelope, ss, proof);
         complaint.sign(&c_sk).expect("sign");
         // Flip the epoch after signing — preimage changes, sig stays.
         complaint.epoch = epoch + 1;
@@ -2072,14 +2010,8 @@ mod tests {
         // Force proof.leaf_index to a different position than
         // against_index suggests.
         proof.leaf_index = 0; // against_index 2 → expected 1
-        let mut complaint = DkgComplaint::new_unsigned(
-            epoch,
-            from_index,
-            target,
-            envelope,
-            ss,
-            proof,
-        );
+        let mut complaint =
+            DkgComplaint::new_unsigned(epoch, from_index, target, envelope, ss, proof);
         complaint.sign(&c_sk).expect("sign");
         assert_eq!(
             verify_complaint(&complaint, &c_pk, &root),
@@ -2094,14 +2026,8 @@ mod tests {
         let target = 3;
         let (_rows, _root, envelope, ss, proof, _c_pk, c_sk, _sk) =
             build_complaint_fixture(epoch, from_index, 6, target);
-        let mut complaint = DkgComplaint::new_unsigned(
-            epoch,
-            from_index,
-            target,
-            envelope,
-            ss,
-            proof,
-        );
+        let mut complaint =
+            DkgComplaint::new_unsigned(epoch, from_index, target, envelope, ss, proof);
         complaint.sign(&c_sk).expect("sign");
         let bytes = complaint.to_bytes();
         let decoded = DkgComplaint::from_bytes(&bytes).expect("decode");
@@ -2115,14 +2041,8 @@ mod tests {
         let target = 3;
         let (_rows, _root, envelope, ss, proof, _c_pk, c_sk, _sk) =
             build_complaint_fixture(epoch, from_index, 6, target);
-        let mut complaint = DkgComplaint::new_unsigned(
-            epoch,
-            from_index,
-            target,
-            envelope,
-            ss,
-            proof,
-        );
+        let mut complaint =
+            DkgComplaint::new_unsigned(epoch, from_index, target, envelope, ss, proof);
         complaint.sign(&c_sk).expect("sign");
         let bytes = complaint.to_bytes();
         assert!(DkgComplaint::from_bytes(&bytes[..bytes.len() - 1]).is_none());
@@ -2139,14 +2059,7 @@ mod tests {
         let target = 1;
         let (_rows, _root, envelope, ss, proof, _c_pk, _c_sk, _sk) =
             build_complaint_fixture(epoch, from_index, 2, target);
-        let complaint = DkgComplaint::new_unsigned(
-            epoch,
-            from_index,
-            target,
-            envelope,
-            ss,
-            proof,
-        );
+        let complaint = DkgComplaint::new_unsigned(epoch, from_index, target, envelope, ss, proof);
         assert!(complaint
             .signing_preimage()
             .starts_with(DKG_COMPLAINT_SIG_DOMAIN));
@@ -2165,8 +2078,10 @@ mod tests {
         // Build contributor's tree.
         let n = 7;
         let rows: Vec<ShareRow> = (1..=n).map(|i| make_row(i, 200 + i as u64)).collect();
-        let leaves: Vec<[u8; 32]> =
-            rows.iter().map(|r| r.leaf_hash(epoch, from_index)).collect();
+        let leaves: Vec<[u8; 32]> = rows
+            .iter()
+            .map(|r| r.leaf_hash(epoch, from_index))
+            .collect();
         let root = compute_merkle_root(&leaves, epoch, from_index);
         let proof = merkle_proof(&leaves, target - 1, epoch, from_index).expect("proof");
 
@@ -2176,8 +2091,8 @@ mod tests {
         let env = encrypt_share_row(&rows[target - 1], &recipient_pk, epoch, from_index)
             .expect("encrypt");
         // Recipient decrypts.
-        let recovered = decrypt_share_row(&env, &recipient_sk, epoch, from_index, target)
-            .expect("decrypt");
+        let recovered =
+            decrypt_share_row(&env, &recipient_sk, epoch, from_index, target).expect("decrypt");
         assert_eq!(recovered, rows[target - 1]);
 
         // Recipient's view: the share is consistent. Filing a
@@ -2185,14 +2100,8 @@ mod tests {
         let kct = KyberCiphertext::from_bytes(&env.kyber_ct).expect("kct from bytes");
         let ss = kyber_decapsulate(&recipient_sk, &kct).expect("decap");
         let (c_pk, c_sk) = falcon_keygen().expect("falcon");
-        let mut complaint = DkgComplaint::new_unsigned(
-            epoch,
-            from_index,
-            target,
-            env,
-            *ss.as_bytes(),
-            proof,
-        );
+        let mut complaint =
+            DkgComplaint::new_unsigned(epoch, from_index, target, env, *ss.as_bytes(), proof);
         complaint.sign(&c_sk).expect("sign");
         assert_eq!(
             verify_complaint(&complaint, &c_pk, &root),
@@ -2223,7 +2132,14 @@ mod tests {
         result
     }
 
-    fn make_committee(n: usize) -> (Vec<KyberPublicKey>, Vec<crate::kyber::KyberSecretKey>, Vec<FalconPublicKey>, Vec<FalconSecretKey>) {
+    fn make_committee(
+        n: usize,
+    ) -> (
+        Vec<KyberPublicKey>,
+        Vec<crate::kyber::KyberSecretKey>,
+        Vec<FalconPublicKey>,
+        Vec<FalconSecretKey>,
+    ) {
         let mut kem_pks = Vec::with_capacity(n);
         let mut kem_sks = Vec::with_capacity(n);
         let mut fal_pks = Vec::with_capacity(n);
@@ -2257,16 +2173,9 @@ mod tests {
             let mut seed = [0u8; 32];
             seed[0] = i as u8;
             seed[1] = epoch as u8;
-            let contrib = generate_dkg_contribution(
-                &seed,
-                epoch,
-                i,
-                n,
-                threshold,
-                &kem_pks,
-                &fal_sks[i - 1],
-            )
-            .expect("contribution");
+            let contrib =
+                generate_dkg_contribution(&seed, epoch, i, n, threshold, &kem_pks, &fal_sks[i - 1])
+                    .expect("contribution");
             contributions.push(contrib);
         }
 
@@ -2299,7 +2208,14 @@ mod tests {
             master_shares.push(aggregate_local_share(j, &rows).expect("aggregate"));
         }
 
-        (contributions, master_shares, kem_pks, kem_sks, fal_pks, fal_sks)
+        (
+            contributions,
+            master_shares,
+            kem_pks,
+            kem_sks,
+            fal_pks,
+            fal_sks,
+        )
     }
 
     #[test]
@@ -2341,14 +2257,8 @@ mod tests {
             seed[0] = from_index as u8;
             seed[1] = epoch as u8;
             for k in 0..SEED_ELEMENTS {
-                let s = sample_goldilocks(
-                    DKG_SECRET_SEED_DOMAIN,
-                    &seed,
-                    from_index,
-                    k,
-                    0,
-                )
-                .expect("sample");
+                let s = sample_goldilocks(DKG_SECRET_SEED_DOMAIN, &seed, from_index, k, 0)
+                    .expect("sample");
                 expected[k] += s;
             }
         }
@@ -2408,8 +2318,7 @@ mod tests {
             full_seed[k] = lagrange_at_zero(&pts);
         }
 
-        let partial: Vec<&MasterShare> =
-            master_shares.iter().take(threshold - 1).collect();
+        let partial: Vec<&MasterShare> = master_shares.iter().take(threshold - 1).collect();
         let mut partial_seed = [Goldilocks::default(); SEED_ELEMENTS];
         for k in 0..SEED_ELEMENTS {
             let pts: Vec<(Goldilocks, Goldilocks)> = partial
@@ -2432,10 +2341,9 @@ mod tests {
         let (kem_pks, kem_sks, fal_pks, fal_sks) = make_committee(n);
         let mut seed = [0u8; 32];
         seed[0] = 1;
-        let contrib = generate_dkg_contribution(
-            &seed, epoch, 1, n, threshold, &kem_pks, &fal_sks[0],
-        )
-        .expect("contribution");
+        let contrib =
+            generate_dkg_contribution(&seed, epoch, 1, n, threshold, &kem_pks, &fal_sks[0])
+                .expect("contribution");
         let (env, proof) = &contrib.recipient_envelopes[1];
         // Attacker's Falcon pk — sig should fail verify under it.
         let (attacker_pk, _attacker_sk) = falcon_keygen().expect("attacker");
@@ -2464,10 +2372,9 @@ mod tests {
         let (kem_pks, kem_sks, fal_pks, fal_sks) = make_committee(n);
         let mut seed = [0u8; 32];
         seed[0] = 1;
-        let contrib = generate_dkg_contribution(
-            &seed, epoch, 1, n, threshold, &kem_pks, &fal_sks[0],
-        )
-        .expect("contribution");
+        let contrib =
+            generate_dkg_contribution(&seed, epoch, 1, n, threshold, &kem_pks, &fal_sks[0])
+                .expect("contribution");
         let (env, proof) = &contrib.recipient_envelopes[1];
         // Wrong expected_epoch.
         let err = verify_received_share(
@@ -2494,10 +2401,9 @@ mod tests {
         let (kem_pks, kem_sks, fal_pks, fal_sks) = make_committee(n);
         let mut seed = [0u8; 32];
         seed[0] = 1;
-        let contrib = generate_dkg_contribution(
-            &seed, epoch, 1, n, threshold, &kem_pks, &fal_sks[0],
-        )
-        .expect("contribution");
+        let contrib =
+            generate_dkg_contribution(&seed, epoch, 1, n, threshold, &kem_pks, &fal_sks[0])
+                .expect("contribution");
         let (env, _proof_for_j2) = &contrib.recipient_envelopes[1];
         // Use proof for j=3 while claiming we're j=2.
         let proof_for_j3 = contrib.recipient_envelopes[2].1.clone();
@@ -2525,10 +2431,9 @@ mod tests {
         let (kem_pks, kem_sks, fal_pks, fal_sks) = make_committee(n);
         let mut seed = [0u8; 32];
         seed[0] = 1;
-        let contrib = generate_dkg_contribution(
-            &seed, epoch, 1, n, threshold, &kem_pks, &fal_sks[0],
-        )
-        .expect("contribution");
+        let contrib =
+            generate_dkg_contribution(&seed, epoch, 1, n, threshold, &kem_pks, &fal_sks[0])
+                .expect("contribution");
         let (env, proof) = &contrib.recipient_envelopes[1];
         // Try decrypting with the WRONG recipient's KEM sk (j=3
         // instead of j=2 it was encrypted for).
@@ -2556,10 +2461,9 @@ mod tests {
         let (kem_pks, kem_sks, fal_pks, fal_sks) = make_committee(n);
         let mut seed = [0u8; 32];
         seed[0] = 1;
-        let mut contrib = generate_dkg_contribution(
-            &seed, epoch, 1, n, threshold, &kem_pks, &fal_sks[0],
-        )
-        .expect("contribution");
+        let mut contrib =
+            generate_dkg_contribution(&seed, epoch, 1, n, threshold, &kem_pks, &fal_sks[0])
+                .expect("contribution");
         // Tamper with the commitment's merkle_root AFTER signing.
         // The Falcon sig still validates against the *original*
         // root, so we have to re-sign over the tampered root for
@@ -2603,26 +2507,16 @@ mod tests {
         let seed = [1u8; 32];
 
         // from_index 0
-        assert!(
-            generate_dkg_contribution(&seed, 1, 0, 4, 3, &kem_pks, &fal_sks[0]).is_err()
-        );
+        assert!(generate_dkg_contribution(&seed, 1, 0, 4, 3, &kem_pks, &fal_sks[0]).is_err());
         // from_index > n
-        assert!(
-            generate_dkg_contribution(&seed, 1, 5, 4, 3, &kem_pks, &fal_sks[0]).is_err()
-        );
+        assert!(generate_dkg_contribution(&seed, 1, 5, 4, 3, &kem_pks, &fal_sks[0]).is_err());
         // threshold > n
-        assert!(
-            generate_dkg_contribution(&seed, 1, 1, 4, 5, &kem_pks, &fal_sks[0]).is_err()
-        );
+        assert!(generate_dkg_contribution(&seed, 1, 1, 4, 5, &kem_pks, &fal_sks[0]).is_err());
         // threshold 0
-        assert!(
-            generate_dkg_contribution(&seed, 1, 1, 4, 0, &kem_pks, &fal_sks[0]).is_err()
-        );
+        assert!(generate_dkg_contribution(&seed, 1, 1, 4, 0, &kem_pks, &fal_sks[0]).is_err());
         // wrong recipient_kem_pks length
         let short_pks = &kem_pks[..3];
-        assert!(
-            generate_dkg_contribution(&seed, 1, 1, 4, 3, short_pks, &fal_sks[0]).is_err()
-        );
+        assert!(generate_dkg_contribution(&seed, 1, 1, 4, 3, short_pks, &fal_sks[0]).is_err());
     }
 
     #[test]

@@ -156,8 +156,8 @@ fn validator_restart_under_load_skeleton() {
         let ok = submit_ok.clone();
         let err = submit_err.clone();
         async move {
-            let faucet_sk = FalconSecretKey::from_bytes(&faucet_sk_bytes)
-                .expect("invalid FALCON secret key");
+            let faucet_sk =
+                FalconSecretKey::from_bytes(&faucet_sk_bytes).expect("invalid FALCON secret key");
             run_faucet_senders(client, rpc_urls, faucet_sk, faucet_addr, stop, ok, err).await;
         }
     });

@@ -684,12 +684,16 @@ impl PydeNode {
         // payloads heavier than the small-message RR protocols. At
         // default 400 ms slot this returns 10 000, matching the
         // pre-refactor libp2p default exactly.
-        let sync_request_timeout_ms = self.config.network.sync_request_timeout_ms.unwrap_or_else(|| {
-            std::cmp::max(
-                pyde_net::config::DEFAULT_SYNC_REQUEST_TIMEOUT.as_millis() as u64,
-                self.config.consensus.block_time_ms.saturating_mul(10),
-            )
-        });
+        let sync_request_timeout_ms =
+            self.config
+                .network
+                .sync_request_timeout_ms
+                .unwrap_or_else(|| {
+                    std::cmp::max(
+                        pyde_net::config::DEFAULT_SYNC_REQUEST_TIMEOUT.as_millis() as u64,
+                        self.config.consensus.block_time_ms.saturating_mul(10),
+                    )
+                });
         let net_config = NetworkConfig {
             port: self.config.network.port,
             max_peers: self.config.network.max_peers,
@@ -976,8 +980,7 @@ impl PydeNode {
         if effective_slot_duration_ms != block_time_ms {
             warn!(
                 requested_block_time_ms = block_time_ms,
-                effective_slot_duration_ms,
-                "block_time_ms clamped to valid range",
+                effective_slot_duration_ms, "block_time_ms clamped to valid range",
             );
         } else {
             info!(
@@ -995,17 +998,31 @@ impl PydeNode {
         if let Some(ms) = self.config.consensus.proposal_timeout_ms {
             let effective = pyde_consensus::view_change::set_proposal_timeout_ms(ms);
             if effective != ms {
-                warn!(requested_ms = ms, effective_ms = effective, "proposal_timeout_ms clamped");
+                warn!(
+                    requested_ms = ms,
+                    effective_ms = effective,
+                    "proposal_timeout_ms clamped"
+                );
             } else {
-                info!(proposal_timeout_ms = effective, "consensus proposal timeout pinned");
+                info!(
+                    proposal_timeout_ms = effective,
+                    "consensus proposal timeout pinned"
+                );
             }
         }
         if let Some(ms) = self.config.consensus.progress_timeout_ms {
             let effective = pyde_consensus::view_change::set_progress_timeout_ms(ms);
             if effective != ms {
-                warn!(requested_ms = ms, effective_ms = effective, "progress_timeout_ms clamped");
+                warn!(
+                    requested_ms = ms,
+                    effective_ms = effective,
+                    "progress_timeout_ms clamped"
+                );
             } else {
-                info!(progress_timeout_ms = effective, "consensus progress timeout pinned");
+                info!(
+                    progress_timeout_ms = effective,
+                    "consensus progress timeout pinned"
+                );
             }
         }
         let now_ms_for_anchor = std::time::SystemTime::now()
@@ -5449,11 +5466,9 @@ async fn maybe_kick_decryption_pipeline(
         );
         return;
     };
-    if let Ok(mut decryptor) = pyde_mempool::decryption::BlockDecryptor::new(
-        enc_txs.clone(),
-        threshold,
-        committee_pks,
-    ) {
+    if let Ok(mut decryptor) =
+        pyde_mempool::decryption::BlockDecryptor::new(enc_txs.clone(), threshold, committee_pks)
+    {
         if let Some(ks) = &identity.key_share {
             decryptor.add_member_shares(ks, &identity.secret_key);
         }
@@ -5575,9 +5590,7 @@ fn broadcast_consensus_with_rr_fallback(
     }
     debug!(
         n_peers = connected_peers.len(),
-        sent,
-        dropped,
-        "consensus broadcast: RR fanout to connected peers"
+        sent, dropped, "consensus broadcast: RR fanout to connected peers"
     );
 }
 
@@ -5902,32 +5915,28 @@ fn handle_swarm_event(
                             // and full-node fallback paths stay
                             // semantically equivalent for non-
                             // boundary blocks.
-                            let (
-                                committee_keys_ref,
-                                epoch_rand_ref,
-                                qc_prev_keys_owned,
-                            ): (&[Vec<u8>], &[u8; 32], Option<Vec<Vec<u8>>>) =
-                                if let Some(ref engine) = validator_engine {
-                                    let cur = engine.committee_keys.as_slice();
-                                    let qc_prev = engine
-                                        .committee_keys_for_slot(block.header.qc_previous.slot);
-                                    let qc_prev_owned = if !std::ptr::eq(qc_prev.as_ptr(), cur.as_ptr()) {
-                                        Some(qc_prev.to_vec())
-                                    } else {
-                                        None
-                                    };
-                                    (
-                                        cur,
-                                        &engine.epoch_randomness,
-                                        qc_prev_owned,
-                                    )
+                            let (committee_keys_ref, epoch_rand_ref, qc_prev_keys_owned): (
+                                &[Vec<u8>],
+                                &[u8; 32],
+                                Option<Vec<Vec<u8>>>,
+                            ) = if let Some(ref engine) = validator_engine {
+                                let cur = engine.committee_keys.as_slice();
+                                let qc_prev =
+                                    engine.committee_keys_for_slot(block.header.qc_previous.slot);
+                                let qc_prev_owned = if !std::ptr::eq(qc_prev.as_ptr(), cur.as_ptr())
+                                {
+                                    Some(qc_prev.to_vec())
                                 } else {
-                                    (
-                                        committee_keys_for_validation,
-                                        epoch_randomness_for_validation,
-                                        None,
-                                    )
+                                    None
                                 };
+                                (cur, &engine.epoch_randomness, qc_prev_owned)
+                            } else {
+                                (
+                                    committee_keys_for_validation,
+                                    epoch_randomness_for_validation,
+                                    None,
+                                )
+                            };
                             if !committee_keys_ref.is_empty() {
                                 if let Err(e) = BlockProcessor::validate_network_block(
                                     chain.chain_id,
@@ -6067,8 +6076,10 @@ fn handle_swarm_event(
                             let prop_attested = peer_manager
                                 .peer_falcon_pubkey(&propagation_source)
                                 .is_some();
-                            let prop_authorized = peer_manager
-                                .is_consensus_authorized(&propagation_source, &engine.committee_keys);
+                            let prop_authorized = peer_manager.is_consensus_authorized(
+                                &propagation_source,
+                                &engine.committee_keys,
+                            );
                             if prop_attested && !prop_authorized {
                                 // audit-416 visibility: was debug!; silent
                                 // drops here masked the slot-1413 wedge
@@ -6088,7 +6099,8 @@ fn handle_swarm_event(
                             prop_attested_committee = prop_attested && prop_authorized;
                             // Secondary: originator, when known.
                             if let Some(source) = message.source.as_ref() {
-                                let src_attested = peer_manager.peer_falcon_pubkey(source).is_some();
+                                let src_attested =
+                                    peer_manager.peer_falcon_pubkey(source).is_some();
                                 let src_authorized = peer_manager
                                     .is_consensus_authorized(source, &engine.committee_keys);
                                 if src_attested && !src_authorized {
@@ -6098,7 +6110,8 @@ fn handle_swarm_event(
                                         "dropping consensus gossip originated by non-committee attested peer"
                                     );
                                     if let Some(info) = peer_manager.get_peer_mut(source) {
-                                        info.invalid_messages = info.invalid_messages.saturating_add(1);
+                                        info.invalid_messages =
+                                            info.invalid_messages.saturating_add(1);
                                     }
                                     return PostEventAction::None;
                                 }
@@ -6470,9 +6483,7 @@ fn handle_swarm_event(
                                                 > engine.consensus.highest_qc.slot
                                         {
                                             let qc_keys = engine
-                                                .committee_keys_for_slot(
-                                                    header.qc_previous.slot,
-                                                )
+                                                .committee_keys_for_slot(header.qc_previous.slot)
                                                 .to_vec();
                                             if pyde_consensus::hotstuff::verify_qc(
                                                 &header.qc_previous,
@@ -6483,9 +6494,7 @@ fn handle_swarm_event(
                                                     header.qc_previous.clone();
                                                 return PostEventAction::ApplyCanonicalAfterQc {
                                                     qc_slot: header.qc_previous.slot,
-                                                    qc_block_hash: header
-                                                        .qc_previous
-                                                        .block_hash,
+                                                    qc_block_hash: header.qc_previous.block_hash,
                                                 };
                                             }
                                         }
@@ -6630,9 +6639,8 @@ fn handle_swarm_event(
                                                 "QcAnnounce idempotent: head already at or past QC slot"
                                             );
                                         } else {
-                                            let qc_keys = engine
-                                                .committee_keys_for_slot(qc.slot)
-                                                .to_vec();
+                                            let qc_keys =
+                                                engine.committee_keys_for_slot(qc.slot).to_vec();
                                             if pyde_consensus::hotstuff::verify_qc(
                                                 &qc,
                                                 &qc_keys,
@@ -6742,9 +6750,7 @@ fn handle_swarm_event(
             // with the recovered body. Pre-handling here keeps
             // `on_response` focused on the slot-keyed batch path.
             if let SyncResp::BlockByHash(maybe_bytes) = &response {
-                let pending_entry = chain_sync
-                    .pending_block_by_hash
-                    .remove(&request_id);
+                let pending_entry = chain_sync.pending_block_by_hash.remove(&request_id);
                 chain_sync.release_pending(request_id);
                 if let Some((qc_slot, qc_block_hash)) = pending_entry {
                     if let Some(bytes) = maybe_bytes {
@@ -6762,9 +6768,7 @@ fn handle_swarm_event(
                         return PostEventAction::None;
                     }
                 } else {
-                    debug!(
-                        "task #94: BlockByHash response with no matching pending entry"
-                    );
+                    debug!("task #94: BlockByHash response with no matching pending entry");
                     return PostEventAction::None;
                 }
             }
@@ -6911,9 +6915,7 @@ fn handle_swarm_event(
             // `None` (peer not in the pin map) preserves the
             // prior "trust whatever the peer attests" behavior
             // for unpinned peers.
-            let pinned_pubkey = bootstrap_pubkey_pins
-                .get(&peer)
-                .map(|pk| pk.as_slice());
+            let pinned_pubkey = bootstrap_pubkey_pins.get(&peer).map(|pk| pk.as_slice());
             let outcome = pyde_net::auth::apply_auth_response(
                 peer,
                 &response,
@@ -7096,15 +7098,12 @@ fn handle_swarm_event(
                                 };
                                 if engine.on_view_change(vc_msg) {
                                     info!(slot, "view change QC formed (via RR fallback) — fallback proposer can proceed");
-                                    if let Some((block, bytes)) =
-                                        build_and_encode_fallback_proposal(
-                                            engine,
-                                            validator_identity.as_ref(),
-                                            chain,
-                                        )
-                                    {
-                                        pending_fallback_proposal_with_body =
-                                            Some((block, bytes));
+                                    if let Some((block, bytes)) = build_and_encode_fallback_proposal(
+                                        engine,
+                                        validator_identity.as_ref(),
+                                        chain,
+                                    ) {
+                                        pending_fallback_proposal_with_body = Some((block, bytes));
                                     }
                                 }
                             }
@@ -7172,13 +7171,10 @@ fn handle_swarm_event(
                                 if qc.slot <= head {
                                     debug!(
                                         qc_slot = qc.slot,
-                                        head,
-                                        "QcAnnounce idempotent via RR fallback"
+                                        head, "QcAnnounce idempotent via RR fallback"
                                     );
                                 } else {
-                                    let qc_keys = engine
-                                        .committee_keys_for_slot(qc.slot)
-                                        .to_vec();
+                                    let qc_keys = engine.committee_keys_for_slot(qc.slot).to_vec();
                                     if pyde_consensus::hotstuff::verify_qc(
                                         &qc,
                                         &qc_keys,
@@ -7872,7 +7868,13 @@ fn load_validator_identity(datadir: &Path, chain_id: u64) -> Result<ValidatorIde
 /// not a chain corruption).
 fn load_or_generate_kem_key(
     datadir: &Path,
-) -> Result<(pyde_crypto::kyber::KyberPublicKey, pyde_crypto::kyber::KyberSecretKey), String> {
+) -> Result<
+    (
+        pyde_crypto::kyber::KyberPublicKey,
+        pyde_crypto::kyber::KyberSecretKey,
+    ),
+    String,
+> {
     use pyde_crypto::kyber::{KyberPublicKey, KyberSecretKey};
     let kem_path = datadir.join("kem.key");
     if kem_path.exists() {
@@ -7892,8 +7894,8 @@ fn load_or_generate_kem_key(
         info!("loaded kem.key (Kyber-768 KEM identity)");
         Ok((pk, sk))
     } else {
-        let (pk, sk) = pyde_crypto::kyber::kyber_keygen()
-            .map_err(|e| format!("kem keygen failed: {}", e))?;
+        let (pk, sk) =
+            pyde_crypto::kyber::kyber_keygen().map_err(|e| format!("kem keygen failed: {}", e))?;
         let pk_bytes = pk.as_bytes();
         let sk_bytes = sk.as_bytes();
         let mut buf = Vec::with_capacity(4 + pk_bytes.len() + sk_bytes.len());

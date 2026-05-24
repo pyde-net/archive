@@ -269,9 +269,7 @@ pub fn set_epoch(epoch: u64) {
 
 pub fn set_committee_size(size: usize) {
     metrics::gauge!("pyde_committee_size").set(size as f64);
-    snapshot()
-        .committee_size
-        .store(size, Ordering::Relaxed);
+    snapshot().committee_size.store(size, Ordering::Relaxed);
 }
 
 pub fn set_current_proposer(addr: [u8; 32]) {
@@ -287,7 +285,5 @@ pub fn set_local_address(addr: [u8; 32]) {
 }
 
 pub fn set_is_validator(v: bool) {
-    snapshot()
-        .is_validator
-        .store(v, Ordering::Relaxed);
+    snapshot().is_validator.store(v, Ordering::Relaxed);
 }
