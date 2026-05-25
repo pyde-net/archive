@@ -22,7 +22,7 @@ use common::*;
 use proptest::prelude::*;
 use pyde_account::address::Address;
 use pyde_state::smt::PydeSMT;
-use pyde_tx::pipeline::{execute_transaction, load_account};
+use pyde_tx::pipeline::{apply_block_fees, execute_transaction, load_account};
 use pyde_tx::types::{FeePayer, Transaction, TransactionType};
 
 fn build_transfer(
@@ -91,6 +91,14 @@ proptest! {
         let tx = build_transfer(sender, sender_sk, recipient, transfer_value, gas_limit, 0);
         let receipt = execute_transaction(&tx, &mut smt, &ctx).unwrap();
         prop_assume!(receipt.success);
+
+        // Validator/treasury fee shares are credited at block finalization
+        // (pipeline::apply_block_fees), not per-tx: execute_transaction debits
+        // the sender the full fee and records the shares on the receipt. Apply
+        // the deferred block-level credit here, otherwise the validator+treasury
+        // portion looks like it left the system and the four-account
+        // conservation invariant fails by exactly that share.
+        apply_block_fees(&mut smt, &validator_addr, std::slice::from_ref(&receipt)).unwrap();
 
         // After-balances.
         let sender_after = load_account(&smt, &sender).balance;
