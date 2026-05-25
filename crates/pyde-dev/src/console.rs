@@ -377,7 +377,7 @@ fn encode_arg_typed(arg: &str, ty: Option<&str>) -> Vec<u8> {
             let s = arg.trim_matches('"');
             let mut encoded = (s.len() as u64).to_le_bytes().to_vec();
             encoded.extend_from_slice(s.as_bytes());
-            while encoded.len() % 8 != 0 {
+            while !encoded.len().is_multiple_of(8) {
                 encoded.push(0);
             }
             encoded
@@ -410,7 +410,7 @@ fn encode_arg(arg: &str) -> Vec<u8> {
     let mut encoded = (bytes.len() as u64).to_le_bytes().to_vec();
     encoded.extend_from_slice(bytes);
     // Pad to 8-byte alignment
-    while encoded.len() % 8 != 0 {
+    while !encoded.len().is_multiple_of(8) {
         encoded.push(0);
     }
     encoded

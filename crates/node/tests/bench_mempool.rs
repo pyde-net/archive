@@ -332,7 +332,7 @@ fn bench_preloaded_mempool() {
         total_commit_ms += commit_elapsed.as_secs_f64() * 1000.0;
 
         block_num += 1;
-        if block_num <= 3 || block_num % 10 == 0 {
+        if block_num <= 3 || block_num.is_multiple_of(10) {
             println!(
                 "    block {}: exec={:.0}ms, commit={:.0}ms ({} writes), {:.0} exec TPS",
                 block_num,

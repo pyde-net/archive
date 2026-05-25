@@ -1346,7 +1346,7 @@ fn encode_instr(
                 0
             };
             let rs2 = if ops.len() > 2 {
-                expect_reg_or_imm(&ops[2], line)? as u32
+                expect_reg_or_imm(&ops[2], line)?
             } else {
                 0
             };

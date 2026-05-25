@@ -283,7 +283,7 @@ mod tests {
         // (In production mode, needs calldata with selector. Skip for this test.)
         assert!(!pyc.runtime.is_empty());
         assert!(
-            pyc.runtime.len() % 4 == 0,
+            pyc.runtime.len().is_multiple_of(4),
             "bytecode should be 4-byte aligned"
         );
     }

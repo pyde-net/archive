@@ -425,13 +425,11 @@ impl SafetyChecker {
                 "test" => {
                     has_test = true;
                 }
-                "should_panic" => {
-                    if !has_test {
-                        self.error(
-                            "#[should_panic] can only be used with #[test]".into(),
-                            attr.span,
-                        );
-                    }
+                "should_panic" if !has_test => {
+                    self.error(
+                        "#[should_panic] can only be used with #[test]".into(),
+                        attr.span,
+                    );
                 }
                 _ => {}
             }
@@ -701,13 +699,11 @@ impl SafetyChecker {
     fn check_block_purity_direct(&mut self, block: &Block, func_name: &str) {
         for stmt in &block.stmts {
             match stmt {
-                Stmt::Assign(a) => {
-                    if self.is_storage_write(&a.target) {
-                        self.error(
-                            format!("#[view] function '{}' cannot modify storage", func_name),
-                            a.span,
-                        );
-                    }
+                Stmt::Assign(a) if self.is_storage_write(&a.target) => {
+                    self.error(
+                        format!("#[view] function '{}' cannot modify storage", func_name),
+                        a.span,
+                    );
                 }
                 Stmt::Emit(e) => {
                     self.error(
@@ -1122,22 +1118,20 @@ impl SafetyChecker {
 
     fn scan_expr_cross_calls(&mut self, expr: &Expr, _span: Span) {
         match expr {
-            Expr::MacroCall(name, args, macro_span) => {
-                if name.name == "cross_call" {
-                    // Look for callback: "fn_name" argument
-                    for arg in args {
-                        if let MacroArg::Named(key, value) = arg {
-                            if key.name == "callback" {
-                                if let Expr::Literal(Literal::String(callback_name), _) = value {
-                                    if !self.contract_functions.contains(callback_name) {
-                                        self.error(
-                                            format!(
-                                                "cross_call! callback '{}' not found in contract",
-                                                callback_name
-                                            ),
-                                            *macro_span,
-                                        );
-                                    }
+            Expr::MacroCall(name, args, macro_span) if name.name == "cross_call" => {
+                // Look for callback: "fn_name" argument
+                for arg in args {
+                    if let MacroArg::Named(key, value) = arg {
+                        if key.name == "callback" {
+                            if let Expr::Literal(Literal::String(callback_name), _) = value {
+                                if !self.contract_functions.contains(callback_name) {
+                                    self.error(
+                                        format!(
+                                            "cross_call! callback '{}' not found in contract",
+                                            callback_name
+                                        ),
+                                        *macro_span,
+                                    );
                                 }
                             }
                         }

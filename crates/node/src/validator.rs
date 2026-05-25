@@ -1010,7 +1010,7 @@ impl ValidatorEngine {
         if elapsed == 0 {
             return None;
         }
-        if elapsed % Self::RESHARE_REBROADCAST_INTERVAL_SLOTS != 0 {
+        if !elapsed.is_multiple_of(Self::RESHARE_REBROADCAST_INTERVAL_SLOTS) {
             return None;
         }
         Some((*target_epoch, bytes.clone()))
@@ -1434,7 +1434,7 @@ impl ValidatorEngine {
             // immediately (gossipsub dedupes but we avoid the extra traffic).
             return None;
         }
-        if elapsed % Self::RESHARE_REBROADCAST_INTERVAL_SLOTS != 0 {
+        if !elapsed.is_multiple_of(Self::RESHARE_REBROADCAST_INTERVAL_SLOTS) {
             return None;
         }
         Some((*target_epoch, bytes.clone()))
@@ -5487,7 +5487,7 @@ mod tests {
 
         // Build two distinct headers at view 0 (vrf_proof omitted →
         // decode_fallback_proof returns None → view defaults to 0).
-        let mut header_a = BlockHeader {
+        let header_a = BlockHeader {
             slot,
             epoch: 0,
             parent_hash: [0u8; 32],

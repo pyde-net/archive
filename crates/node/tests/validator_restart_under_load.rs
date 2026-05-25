@@ -179,7 +179,7 @@ fn validator_restart_under_load_skeleton() {
     let pre_kill_ok = submit_ok.load(Ordering::Relaxed);
     eprintln!("pre-kill: head={pre_kill_head}, txs ok={pre_kill_ok}");
     assert!(
-        wedge_detected.load(Ordering::Relaxed) == false,
+        !wedge_detected.load(Ordering::Relaxed),
         "wedge detected during pre-kill load window",
     );
 

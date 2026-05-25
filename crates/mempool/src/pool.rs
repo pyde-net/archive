@@ -586,10 +586,7 @@ impl Mempool {
             if let std::collections::hash_map::Entry::Vacant(_) = entry {
                 sender_order.push(tx.sender);
             }
-            per_sender
-                .entry(tx.sender)
-                .or_insert_with(VecDeque::new)
-                .push_back(tx);
+            per_sender.entry(tx.sender).or_default().push_back(tx);
         }
 
         // Step 2: round-robin selection. `exhausted` short-circuits

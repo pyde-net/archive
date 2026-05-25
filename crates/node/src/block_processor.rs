@@ -1163,10 +1163,10 @@ impl BlockProcessor {
                 if let Some(acct_bytes) = state.get(&balance_key) {
                     if let Some(acct) = pyde_account::types::Account::from_bytes(&acct_bytes) {
                         match &acct.auth_keys {
-                            pyde_account::types::AuthKeys::Single(pk) => {
-                                if !tx.verify_signature(pk) {
-                                    return Err(format!("tx {} has invalid signature", i));
-                                }
+                            pyde_account::types::AuthKeys::Single(pk)
+                                if !tx.verify_signature(pk) =>
+                            {
+                                return Err(format!("tx {} has invalid signature", i));
                             }
                             pyde_account::types::AuthKeys::None => {
                                 // System account — no sig check

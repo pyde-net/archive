@@ -192,7 +192,7 @@ pub fn is_valid_private_key(hex: &str) -> bool {
 /// Check if a string is valid hex (with or without 0x prefix).
 pub fn is_hex_string(value: &str) -> bool {
     let hex = value.trim_start_matches("0x");
-    !hex.is_empty() && hex.len() % 2 == 0 && hex.chars().all(|c| c.is_ascii_hexdigit())
+    !hex.is_empty() && hex.len().is_multiple_of(2) && hex.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Convert bytes to a 0x-prefixed hex string.

@@ -252,7 +252,7 @@ pub fn merkle_proof(
     let mut idx = leaf_index;
     let mut siblings = Vec::new();
     while level.len() > 1 {
-        let sibling = if idx % 2 == 0 {
+        let sibling = if idx.is_multiple_of(2) {
             level[idx + 1]
         } else {
             level[idx - 1]
@@ -277,7 +277,7 @@ pub fn verify_merkle_proof(root: &[u8; 32], leaf: &[u8; 32], proof: &MerkleProof
     let mut idx = proof.leaf_index;
     let mut cur = *leaf;
     for sib in &proof.siblings {
-        cur = if idx % 2 == 0 {
+        cur = if idx.is_multiple_of(2) {
             node_hash(&cur, sib)
         } else {
             node_hash(sib, &cur)
@@ -1852,7 +1852,7 @@ mod tests {
         // ShareRow.
         let (recipient_pk, _recipient_sk) = kyber_keygen().expect("recipient");
         let (kct, ss) = kyber_encapsulate(&recipient_pk).expect("encap");
-        let mut garbage = vec![0xFFu8; ShareRow::WIRE_LEN];
+        let mut garbage = [0xFFu8; ShareRow::WIRE_LEN];
         // First 4 bytes = receiver_index; everything else is the
         // 8 Goldilocks values. Set every Goldilocks value to
         // u64::MAX (which is >= GOLDILOCKS_PRIME so ShareRow

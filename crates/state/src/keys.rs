@@ -437,7 +437,7 @@ mod tests {
     #[test]
     fn no_collision_across_all_domains() {
         let a = test_addr(0x1234);
-        let keys = vec![
+        let keys = [
             balance_key(&a),
             nonce_key(&a),
             code_key(&a),

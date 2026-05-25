@@ -628,7 +628,7 @@ fn comprehensive_soak() {
                 }
 
                 // Every 60s: print head + dump per-node logs to disk.
-                if tick % 60 == 0 {
+                if tick.is_multiple_of(60) {
                     eprintln!("    [watchdog] head={} stall={}s", last_head, stall_secs,);
                     for (i, out) in outputs.iter().enumerate() {
                         if let Ok(buf) = out.lock() {

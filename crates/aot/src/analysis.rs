@@ -78,7 +78,7 @@ pub fn analyze(bytecode: &[u8]) -> Result<AnalyzedProgram, AnalysisError> {
     if bytecode.is_empty() {
         return Err(AnalysisError::EmptyBytecode);
     }
-    if bytecode.len() % 4 != 0 {
+    if !bytecode.len().is_multiple_of(4) {
         return Err(AnalysisError::UnalignedBytecode);
     }
 
