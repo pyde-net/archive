@@ -30,7 +30,7 @@ ethnum = "1.5.2"
 
 # Encryption
 aes-gcm = "0.10"
-rand = "0.8"
+rand = "0.9"
 # Memory-hard KDF for keystore passphrases (audit 306).
 argon2 = "0.5"
 # Audit 358: Zeroize wrapper for the AES key derived from

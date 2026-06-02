@@ -68,7 +68,7 @@ sparse-merkle-tree = "0.6"
 lru = "0.16"
 # Validator keystore encryption (audit 221).
 aes-gcm = "0.10"
-rand = "0.8"
+rand = "0.9"
 # Memory-hard KDF for keystore passphrases (audit 306). Argon2id
 # replaces the prior single-iteration Poseidon2 KDF; same crate
 # is used in pyde-rust-sdk + pyde-dev so all three keystore

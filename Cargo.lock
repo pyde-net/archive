@@ -1040,7 +1040,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ab67060fc6b8ef687992d439ca0fa36e7ed17e9a0b16b25b601e8757df720de"
 dependencies = [
  "data-encoding",
- "syn 2.0.117",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -3785,7 +3785,7 @@ dependencies = [
  "pyde-crypto",
  "pyde-tx",
  "pyde-vm",
- "rand 0.8.6",
+ "rand 0.9.4",
  "reqwest",
  "rpassword",
  "serde",
@@ -3853,7 +3853,7 @@ dependencies = [
  "pyde-state",
  "pyde-tx",
  "pyde-vm",
- "rand 0.8.6",
+ "rand 0.9.4",
  "ratatui",
  "rayon",
  "reqwest",
@@ -3884,7 +3884,7 @@ dependencies = [
  "pyde-crypto",
  "pyde-mempool",
  "pyde-tx",
- "rand 0.8.6",
+ "rand 0.9.4",
  "reqwest",
  "serde",
  "serde_json",
