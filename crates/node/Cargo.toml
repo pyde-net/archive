@@ -90,7 +90,7 @@ ratatui = "0.29"
 crossterm = "0.28"
 
 [dev-dependencies]
-reqwest = { version = "0.12", features = ["json", "blocking"] }
+reqwest = { version = "0.13", features = ["json", "blocking"] }
 otic = { path = "../otic" }
 tempfile = "3"
 pyde-rust-sdk = { path = "../pyde-rust-sdk" }
